@@ -13,13 +13,33 @@ ENV PYTHONUNBUFFERED=1 \
 # -----------------------------
 # Install Java & System Utilities
 # -----------------------------
+# ADDED: wget so we can download the JARs
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         openjdk-17-jre-headless \
         curl \
+        wget \
         bash \
         procps \
     && rm -rf /var/lib/apt/lists/*
+
+# -----------------------------
+# Install Python dependencies (Moved up!)
+# -----------------------------
+# PySpark MUST be installed before we can put JARs in its directory
+RUN pip install \
+    pyspark==3.5.2 \
+    pandas \
+    openmeteo-requests \
+    requests-cache \
+    retry-requests
+
+# -----------------------------
+# Bake Maven JARs directly into Spark
+# -----------------------------
+RUN wget https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-3.5_2.12/1.5.0/iceberg-spark-runtime-3.5_2.12-1.5.0.jar -P $SPARK_HOME/jars/ && \
+    wget https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-aws-bundle/1.5.0/iceberg-aws-bundle-1.5.0.jar -P $SPARK_HOME/jars/ && \
+    wget https://repo1.maven.org/maven2/org/projectnessie/nessie-integrations/nessie-spark-extensions-3.5_2.12/0.108.4/nessie-spark-extensions-3.5_2.12-0.108.4.jar -P $SPARK_HOME/jars/
 
 # -----------------------------
 # Create spark user & group
@@ -43,16 +63,6 @@ RUN mkdir -p \
         /opt/spark
 
 WORKDIR /opt/spark/work-dir
-
-# -----------------------------
-# Install Python dependencies
-# -----------------------------
-RUN pip install \
-    pyspark==3.5.2 \
-    pandas \
-    openmeteo-requests \
-    requests-cache \
-    retry-requests
 
 # -----------------------------
 # Copy application script

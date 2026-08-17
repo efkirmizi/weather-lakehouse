@@ -1,5 +1,5 @@
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.datasets import Dataset
 from airflow.providers.docker.operators.docker import DockerOperator
@@ -30,4 +30,5 @@ with DAG(
         docker_url="unix://var/run/docker.sock",
         outlets=[raw_weather_dataset],
         retries=0,
+        execution_timeout=timedelta(hours=2),
     )
