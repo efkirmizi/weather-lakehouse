@@ -1,0 +1,203 @@
+services:
+  # 1. THE STORAGE LAYER
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: minio
+    ports:
+      - "9000:9000"  # S3 API
+      - "9001:9001"  # console
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ADMIN_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ADMIN_PASSWORD}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  # 1b. ONE-SHOT BUCKET BOOTSTRAP
+  minio-init:
+    image: minio/mc:latest
+    container_name: minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 '${MINIO_ADMIN_USER}' '${MINIO_ADMIN_PASSWORD}' &&
+      mc mb --ignore-existing local/warehouse &&
+      mc mb --ignore-existing local/mlflow &&
+      echo 'buckets ready'
+      "
+    restart: "no"
+
+  # 2. THE CATALOG BACKEND (Isolated Nessie DB)
+  postgres-nessie:
+    image: postgres:18
+    container_name: postgres-nessie
+    environment:
+      POSTGRES_DB: ${NESSIE_DB_NAME}
+      POSTGRES_USER: ${NESSIE_DB_USER}
+      POSTGRES_PASSWORD: ${NESSIE_DB_PASSWORD}
+    volumes:
+      - postgres_nessie_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${NESSIE_DB_USER} -d ${NESSIE_DB_NAME}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # 3. THE CATALOG ENGINE
+  nessie:
+    image: ghcr.io/projectnessie/nessie:0.108.4
+    container_name: nessie
+    ports:
+      - "19120:19120"
+      - "9010:9000"
+    depends_on:
+      postgres-nessie:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      nessie.version.store.type: JDBC2
+      nessie.version.store.persist.jdbc.datasource: postgresql
+      quarkus.datasource.postgresql.jdbc.url: jdbc:postgresql://postgres-nessie:5432/${NESSIE_DB_NAME}
+      quarkus.datasource.postgresql.username: ${NESSIE_DB_USER}
+      quarkus.datasource.postgresql.password: ${NESSIE_DB_PASSWORD}
+      nessie.catalog.default-warehouse: warehouse
+      nessie.catalog.warehouses.warehouse.location: s3://warehouse/
+      nessie.catalog.service.s3.default-options.endpoint: http://minio:9000/
+      nessie.catalog.service.s3.default-options.region: us-east-1
+      nessie.catalog.service.s3.default-options.path-style-access: "true"
+      nessie.catalog.service.s3.default-options.auth-type: STATIC
+      nessie.catalog.service.s3.default-options.access-key: urn:nessie-secret:quarkus:nessie.catalog.secrets.access-key
+      nessie.catalog.secrets.access-key.name: ${MINIO_ADMIN_USER}
+      nessie.catalog.secrets.access-key.secret: ${MINIO_ADMIN_PASSWORD}
+      nessie.server.authentication.enabled: "false"
+    restart: unless-stopped
+
+  # 4. THE ORCHESTRATION BACKEND (Isolated Airflow DB)
+  postgres-airflow:
+    image: postgres:18
+    container_name: postgres-airflow
+    environment:
+      POSTGRES_DB: ${AIRFLOW_DB_NAME}
+      POSTGRES_USER: ${AIRFLOW_DB_USER}
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD}
+    volumes:
+      - postgres_airflow_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AIRFLOW_DB_USER} -d ${AIRFLOW_DB_NAME}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # 5. THE ORCHESTRATOR INIT
+  airflow-init:
+    image: apache/airflow:2.10.1
+    container_name: airflow-init
+    user: "0:0" # Temporarily run as root to fix host permissions
+    depends_on:
+      postgres-airflow:
+        condition: service_healthy
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@postgres-airflow:5432/${AIRFLOW_DB_NAME}
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+    command: >
+      bash -c "
+      mkdir -p /opt/airflow/dags /opt/airflow/logs &&
+      chown -R 50000:0 /opt/airflow/dags /opt/airflow/logs &&
+      su airflow -c 'airflow db migrate && airflow users create --username ${_AIRFLOW_WWW_USER_USERNAME} --password ${_AIRFLOW_WWW_USER_PASSWORD} --firstname Admin --lastname User --role Admin --email admin@example.com || true'
+      "
+
+  # 6. THE ORCHESTRATOR COMPONENTS
+  airflow-webserver:
+    image: apache/airflow:2.10.1
+    container_name: airflow-webserver
+    user: "50000:0"
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    environment:
+      _PIP_ADDITIONAL_REQUIREMENTS: 'apache-airflow-providers-docker'
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@postgres-airflow:5432/${AIRFLOW_DB_NAME}
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+      AWS_ACCESS_KEY_ID: ${MINIO_ADMIN_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ADMIN_PASSWORD}
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: webserver
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    group_add:
+      - "${DOCKER_GID}"
+
+  airflow-scheduler:
+    image: apache/airflow:2.10.1
+    container_name: airflow-scheduler
+    user: "50000:0"
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    environment:
+      _PIP_ADDITIONAL_REQUIREMENTS: 'apache-airflow-providers-docker'
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@postgres-airflow:5432/${AIRFLOW_DB_NAME}
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      AWS_ACCESS_KEY_ID: ${MINIO_ADMIN_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ADMIN_PASSWORD}
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: scheduler
+    group_add:
+      - "${DOCKER_GID}"
+    
+  # 7. THE MLOPS TRACKING SERVER
+  mlflow:
+    image: python:3.11-slim
+    container_name: mlflow
+    ports:
+      - "5000:5000"
+    environment:
+      - AWS_ACCESS_KEY_ID=${MINIO_ADMIN_USER}
+      - AWS_SECRET_ACCESS_KEY=${MINIO_ADMIN_PASSWORD}
+      - MLFLOW_S3_ENDPOINT_URL=http://minio:9000
+    command: bash -c "pip install --no-cache-dir mlflow boto3 && mlflow server --host 0.0.0.0 --port 5000 --backend-store-uri sqlite:////mlflow/mlflow.db --default-artifact-root s3://mlflow/ --allowed-hosts '*'"
+    volumes:
+      - mlflow_data:/mlflow
+    depends_on:
+      - minio-init
+    networks:
+      default:
+
+volumes:
+  minio_data:
+  postgres_nessie_data:
+  postgres_airflow_data:
+  mlflow_data:
+
+networks:
+  default:
+    name: lakehouse-net

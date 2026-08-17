@@ -1,0 +1,36 @@
+# Python & Virtual Environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# PyTorch & Machine Learning Models
+*.pth
+*.pt
+*.onnx
+*.safetensors
+
+# Data & Lakehouse Storage (Iceberg, MinIO, Spark)
+data/
+minio_data/
+warehouse/
+spark-warehouse/
+metastore_db/
+.ivy2/
+derby.log
+
+# MLflow
+mlruns/
+mlartifacts/
+
+# Airflow
+logs/
+airflow.cfg
+airflow.db
+webserver_config.py
+
+# Docker & Secrets
+.env
+*.env
+.aws/
