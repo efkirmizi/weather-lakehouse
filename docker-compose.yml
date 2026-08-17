@@ -112,12 +112,19 @@ services:
     volumes:
       - ./dags:/opt/airflow/dags
       - ./logs:/opt/airflow/logs
-    command: >
-      bash -c "
-      mkdir -p /opt/airflow/dags /opt/airflow/logs &&
-      chown -R 50000:0 /opt/airflow/dags /opt/airflow/logs &&
-      su airflow -c 'airflow db migrate && airflow users create --username ${_AIRFLOW_WWW_USER_USERNAME} --password ${_AIRFLOW_WWW_USER_PASSWORD} --firstname Admin --lastname User --role Admin --email admin@example.com || true'
-      "
+    command:
+      - bash
+      - -c
+      - |
+        mkdir -p /opt/airflow/dags /opt/airflow/logs
+        chown -R 50000:0 /opt/airflow/dags /opt/airflow/logs
+        
+        # Switch to airflow user for all database and CLI commands
+        su airflow -c "
+          airflow db migrate &&
+          airflow users create --username ${_AIRFLOW_WWW_USER_USERNAME} --password ${_AIRFLOW_WWW_USER_PASSWORD} --firstname Admin --lastname User --role Admin --email admin@example.com || true &&
+          airflow pools set single_gpu 2 'Limit concurrency for GPU and heavy ETL tasks'
+        "
 
   # 6. THE ORCHESTRATOR COMPONENTS
   airflow-webserver:

@@ -15,6 +15,7 @@ with DAG(
     start_date=datetime(2026, 8, 14),
     catchup=False,
     tags=["lstm", "ml", "pytorch", "training", "gpu"],
+    is_paused_upon_creation=False,
 ) as dag:
 
     train_lstm_task = DockerOperator(

@@ -14,6 +14,7 @@ with DAG(
     start_date=datetime(2026, 8, 14),
     catchup=False,
     tags=["ml", "pytorch", "training", "gpu", "attention"],
+    is_paused_upon_creation=False,
 ) as dag:
 
     train_transformer_task = DockerOperator(

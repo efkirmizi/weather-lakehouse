@@ -14,6 +14,7 @@ with DAG(
     start_date=datetime(2026, 8, 14),
     catchup=False,
     tags=["etl", "spark", "iceberg"],
+    is_paused_upon_creation=False,
 ) as dag:
 
     pyspark_etl_task = DockerOperator(

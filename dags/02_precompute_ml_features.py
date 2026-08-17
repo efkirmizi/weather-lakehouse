@@ -15,6 +15,7 @@ with DAG(
     start_date=datetime(2026, 8, 14),
     catchup=False,
     tags=["ml", "spark", "feature-engineering"],
+    is_paused_upon_creation=False,
 ) as dag:
 
     feature_engineering_task = DockerOperator(
