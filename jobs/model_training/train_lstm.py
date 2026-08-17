@@ -29,8 +29,8 @@ logger.info("All heavy libraries imported successfully! Setting up hyperparamete
 # ==========================================
 SEQ_LEN = 72         # 3 days of context
 PRED_LEN = 24        # 1 day prediction
-BATCH_SIZE = 512     # High throughput
-EPOCHS = 20          
+BATCH_SIZE = 2048     # High throughput
+EPOCHS = 1
 LEARNING_RATE = 0.001
 WEIGHT_DECAY = 1e-4  
 FEATURE_DIM = 4      
@@ -254,16 +254,20 @@ def main():
                 logger.info(f"New best model saved! (Val Loss: {best_val_loss:.4f})")
 
         # 4. Log Best Model to MLflow
-        logger.info("Logging final PyTorch model artifact to MLflow...")
+        logger.info("Loading best weights and logging full model artifact to MLflow...")
         model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
         
+        # Move model to CPU for a clean, device-agnostic save
+        model.to("cpu")
         sample_input, _ = next(iter(val_loader))
         
         mlflow.pytorch.log_model(
             model, 
-            artifact_path="weather_fast_lstm_model",
-            input_example=sample_input.numpy()
+            name="weather_fast_lstm_model",  # Updated from artifact_path to name
+            input_example=sample_input.numpy(),
+            serialization_format="pickle"
         )
+            
         logger.info("MLflow model logging completed.")
 
 if __name__ == "__main__":

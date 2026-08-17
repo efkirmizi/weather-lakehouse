@@ -38,14 +38,14 @@ logger.info("All heavy libraries imported successfully! Setting up hyperparamete
 # ==========================================
 SEQ_LEN = 72         
 PRED_LEN = 24
-BATCH_SIZE = 512     
-EPOCHS = 20          
+BATCH_SIZE = 2048     
+EPOCHS = 1
 LEARNING_RATE = 0.001
 WEIGHT_DECAY = 1e-4
 FEATURE_DIM = 4
 D_MODEL = 32
 N_HEAD = 2
-NUM_LAYERS = 4        # INCREASED: Added 2 layers to hit ~54k parameter target
+NUM_LAYERS = 4
 DIM_FEEDFORWARD = 128 
 DROPOUT = 0.1
 PATIENCE = 4         
@@ -279,14 +279,17 @@ def main():
         logger.info("Loading best weights and logging full model artifact to MLflow...")
         model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
         
+        model.to("cpu")
         sample_input, _ = next(iter(val_loader))
         
         mlflow.pytorch.log_model(
             model, 
-            artifact_path="weather_transformer_model",
-            input_example=sample_input.numpy()
+            name="weather_transformer_model",
+            input_example=sample_input.numpy(),
+            serialization_format="pickle"
         )
-        logger.info("MLflow logging completed successfully.")
+            
+        logger.info("MLflow model logging completed.")
 
 if __name__ == "__main__":
     main()
