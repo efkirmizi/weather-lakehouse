@@ -5,6 +5,7 @@ from airflow import DAG
 from airflow.datasets import Dataset
 from airflow.operators.python import BranchPythonOperator
 from airflow.providers.docker.operators.docker import DockerOperator
+from airflow.utils.trigger_rule import TriggerRule
 from docker.types import DeviceRequest
 
 MODEL_NAME = "Weather_Forecaster_Transformer"
@@ -84,5 +85,26 @@ with DAG(
         execution_timeout=timedelta(minutes=45), # Tight timeout for 5 epochs
     )
 
+    # 4. Downstream Champion vs Challenger Evaluation Gate
+    evaluate_and_promote_task = DockerOperator(
+        task_id="evaluate_and_promote_model",
+        image="dag-pytorch-model-training:1.0",
+        api_version="auto",
+        auto_remove=True,
+        network_mode="lakehouse-net",
+        environment={
+            "AWS_ACCESS_KEY_ID": os.getenv("AWS_ACCESS_KEY_ID"),
+            "AWS_SECRET_ACCESS_KEY": os.getenv("AWS_SECRET_ACCESS_KEY"),
+            "MODEL_REGISTRY_NAME": MODEL_NAME
+        },
+        command="python evaluate_and_promote.py",
+        docker_url="unix://var/run/docker.sock",
+        device_requests=[DeviceRequest(count=-1, capabilities=[['gpu']])],
+        pool="single_gpu",
+        retries=0,
+        trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS, # Executes regardless of which training branch ran
+        execution_timeout=timedelta(minutes=15),
+    )
+
     # Define the DAG Graph
-    check_registry >> [full_training, incremental_training]
+    check_registry >> [full_training, incremental_training] >> evaluate_and_promote_task
