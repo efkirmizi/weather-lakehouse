@@ -47,10 +47,8 @@ WORKDIR /opt/spark/work-dir
 # -----------------------------
 # Install Python dependencies
 # -----------------------------
-RUN pip install \
-    pyspark==3.5.2 \
-    numpy \
-    pandas
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
 # -----------------------------
 # Copy application script

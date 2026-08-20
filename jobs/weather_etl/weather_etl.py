@@ -22,6 +22,9 @@ NESSIE_VERSION = "0.108.4"
 # The Historical API uses a different endpoint than the forecast API
 API_URL = "https://archive-api.open-meteo.com/v1/archive"
 TABLE_NAME = "nessie.weather.observations"
+# Normalization statistics live with the job that actually fits the scaler
+# (feature_engineering.py). Recomputing them here would drift from it, not least
+# because scaling happens after imputation.
 EARLIEST_DATA_DATE = "1940-01-01"
 
 DEFAULT_PARAMS = {
@@ -143,6 +146,41 @@ def transform_weather_data(response: Any) -> pd.DataFrame:
     df.dropna(inplace=True)
     return df
 
+def run_data_quality_checks(df: pd.DataFrame) -> None:
+    """Runs strict data quality assertions before Lakehouse ingestion."""
+    logger.info("Executing Data Quality Gates...")
+    
+    # 1. Null Checks
+    if df.isnull().values.any():
+        raise ValueError("Data Quality Failure: DataFrame contains NULL values.")
+        
+    # 2. Physical Range Bounds (e.g., Temperature between -60C and 60C)
+    if not df['temperature_c'].between(-60, 60).all():
+        raise ValueError("Data Quality Failure: Temperature out of physical bounds.")
+        
+    if not df['humidity_percent'].between(0, 100).all():
+        raise ValueError("Data Quality Failure: Humidity out of bounds (0% to 100%).")
+        
+    if not df['wind_speed_kmh'].between(0, 300).all(): # Max realistic wind speed
+        raise ValueError("Data Quality Failure: Wind speed exceeds realistic bounds.")
+        
+    # 3. Sequential Continuity Check
+    #
+    # A warning rather than a failure on purpose: the Open-Meteo archive genuinely
+    # has holes in the older decades, and transform_weather_data drops those rows.
+    # Downstream is what has to be gap-safe - IcebergTimeSeriesDataset skips windows
+    # that span a gap, and batch_inference refuses a discontinuous context window.
+    df_sorted = df.sort_values('timestamp')
+    time_diffs = df_sorted['timestamp'].diff().dropna()
+    gaps = time_diffs[time_diffs != pd.Timedelta(hours=1)]
+    if not gaps.empty:
+        logger.warning(
+            f"Data Quality Warning: {len(gaps)} time series gap(s) detected, "
+            f"largest {gaps.max()}. Windows spanning them will be skipped downstream."
+        )
+        
+    logger.info("Data Quality Gates Passed! Data is pristine.")
+
 def load_to_lakehouse(spark: SparkSession, pandas_df: pd.DataFrame) -> None:
     """Appends data to the Iceberg table."""
     spark_df = spark.createDataFrame(pandas_df)
@@ -169,8 +207,11 @@ def main() -> None:
             # 1. EXTRACT
             response = extract_weather_chunk(API_URL, DEFAULT_PARAMS, start_str, end_str)
             
-            # 2. TRANSFORM
+            # 2a. TRANSFORM
             pandas_df = transform_weather_data(response)
+            
+            # 2b. DATA QUALITY GATE
+            run_data_quality_checks(pandas_df)
             
             # 3. LOAD
             load_to_lakehouse(spark, pandas_df)
@@ -178,7 +219,7 @@ def main() -> None:
 
             # ADD THIS SLEEP: Pause for seconds to respect Open-Meteo's rate limits
             time.sleep(10)
-            
+
         logger.info("Historical backfill completed successfully!")
     except Exception as e:
         logger.critical(f"ETL Pipeline failed: {e}", exc_info=True)

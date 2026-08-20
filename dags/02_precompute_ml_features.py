@@ -1,8 +1,10 @@
-import os
 from datetime import datetime
 from airflow import DAG
 from airflow.datasets import Dataset
 from airflow.providers.docker.operators.docker import DockerOperator
+
+from alerting import DEFAULT_ARGS
+from credentials import s3_env
 
 # Define dataset triggers and outlets
 raw_weather_dataset = Dataset("iceberg://nessie.weather.observations")
@@ -15,6 +17,7 @@ with DAG(
     start_date=datetime(2026, 8, 14),
     catchup=False,
     tags=["ml", "spark", "feature-engineering"],
+    default_args=DEFAULT_ARGS,
     is_paused_upon_creation=False,
 ) as dag:
 
@@ -25,8 +28,11 @@ with DAG(
         auto_remove=True,
         network_mode="lakehouse-net",
         environment={
-            "AWS_ACCESS_KEY_ID": os.getenv("AWS_ACCESS_KEY_ID"),
-            "AWS_SECRET_ACCESS_KEY": os.getenv("AWS_SECRET_ACCESS_KEY"),
+            **s3_env(),
+            # The job appends only new observations unless the normalization has
+            # drifted. Pass conf {"FEATURE_REBUILD": "full"} to renormalize the whole
+            # table on demand.
+            "FEATURE_REBUILD": "{{ dag_run.conf.get('FEATURE_REBUILD', '') }}",
         },
         command="python3 /opt/spark/work-dir/feature_engineering.py",
         docker_url="unix://var/run/docker.sock",

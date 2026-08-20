@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # Instant, no Docker, no dependencies. This job alone would have caught two of the
+  # regressions this pipeline has actually shipped: a DAG file Airflow silently
+  # skipped, and a function-local import that shadowed a module used above it.
+  static:
+    name: static checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install pytest
+      - run: python -m pytest tests/static -q
+
+  dags:
+    name: DAG parsing
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the Airflow image
+        run: docker build -t airflow-ci ./docker/airflow
+      - name: Parse the DAG folder the way the scheduler does
+        run: |
+          docker run --rm \
+            -v "$PWD/dags":/opt/airflow/dags \
+            -v "$PWD/tests":/tests \
+            -e AIRFLOW__CORE__LOAD_EXAMPLES=False \
+            airflow-ci \
+            bash -c "pip install -q pytest && python -m pytest /tests/airflow -q -p no:cacheprovider"
+
+  unit:
+    name: unit tests (light images)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build feature engineering image
+        run: docker build -t fe-ci ./jobs/feature_engineering
+      - name: Feature engineering tests
+        run: |
+          docker run --rm --user root -v "$PWD/tests":/tests \
+            -e PYTHONPATH=/opt/spark/work-dir fe-ci \
+            sh -c "pip install -q pytest && python -m pytest /tests/unit/test_feature_engineering.py -q -p no:cacheprovider"
+
+      - name: Build serving image
+        run: docker build -t serving-ci ./jobs/serving
+      - name: Serving tests
+        run: |
+          docker run --rm --user root -v "$PWD/tests":/tests \
+            -e PYTHONPATH=/app serving-ci \
+            sh -c "pip install -q pytest && python -m pytest /tests/unit/test_serving.py -q -p no:cacheprovider"
+
+  # dag-pytorch-model-training is ~11GB (CUDA base) and does not fit a hosted runner's
+  # disk budget. Its suite - tests/unit/test_data_loader.py and test_trainer.py - runs
+  # via `./dev.sh test-unit` locally, or here if a self-hosted runner is added.

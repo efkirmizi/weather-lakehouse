@@ -14,28 +14,39 @@ from mlflow.tracking import MlflowClient
 from data_loader import get_dataloaders
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Deliberately no autocast here, unlike training. The promotion threshold is 1% and
+# the observed margins have been ~0.2%, which is inside fp16 noise - a benchmark that
+# decides deployments has to be reproducible.
 
 def compute_metrics(model, dataloader, criterion):
-    """Evaluates a model over a DataLoader and computes Loss, RMSE, and MAE."""
+    """Evaluates a model over a DataLoader and computes Loss, RMSE and MAE.
+
+    RMSE is the real thing - sqrt of the mean squared error - not sqrt of the
+    SmoothL1 objective, and both errors are accumulated over elements so a short
+    final batch does not get the same weight as a full one.
+    """
     model.eval()
     total_loss = 0.0
-    total_mae = 0.0
-    
+    sq_error_sum = 0.0
+    abs_error_sum = 0.0
+    element_count = 0
+
     with torch.no_grad():
         for x_val, y_val in dataloader:
             x_val = x_val.to(device, non_blocking=True)
             y_val = y_val.to(device, non_blocking=True)
-            
-            with torch.amp.autocast('cuda' if torch.cuda.is_available() else 'cpu'):
-                preds = model(x_val)
-                loss = criterion(preds, y_val)
-                
-            total_loss += loss.item()
-            total_mae += torch.abs(preds - y_val).mean().item()
-            
+
+            preds = model(x_val)
+            total_loss += criterion(preds, y_val).item()
+
+            diff = preds.float() - y_val.float()
+            sq_error_sum += torch.sum(diff * diff).item()
+            abs_error_sum += torch.sum(diff.abs()).item()
+            element_count += diff.numel()
+
     avg_loss = total_loss / len(dataloader)
-    rmse = math.sqrt(avg_loss)
-    mae = total_mae / len(dataloader)
+    rmse = math.sqrt(sq_error_sum / element_count)
+    mae = abs_error_sum / element_count
     return avg_loss, rmse, mae
 
 def evaluate_and_promote(model_name: str, table_name: str = "weather.ml_features"):
@@ -63,9 +74,17 @@ def evaluate_and_promote(model_name: str, table_name: str = "weather.ml_features
     except Exception:
         logger.info("No Champion currently crowned. First registered model will be promoted automatically.")
 
-    # 3. Load standard holdout benchmark data from Iceberg
-    # We evaluate on full historical validation split to prevent bias
-    _, val_loader = get_dataloaders(
+    # 3. First-time deployment needs no benchmark - decide before loading 750k windows.
+    if champion_version is None or champion_version == challenger_version:
+        logger.info(f"Promoting v{challenger_version} to '@champion' (Initial Baseline)...")
+        client.set_registered_model_alias(name=model_name, alias="champion", version=challenger_version)
+        logger.info("Model successfully crowned Champion!")
+        return
+
+    # 4. Load the held-out test split. Training early-stops on the validation split,
+    # so scoring the challenger there would judge it on its own tuning data. The test
+    # block is chronological and seeded, so both models see identical windows.
+    *_, test_loader = get_dataloaders(
         table_name=table_name,
         seq_len=72,
         pred_len=24,
@@ -73,13 +92,6 @@ def evaluate_and_promote(model_name: str, table_name: str = "weather.ml_features
         is_incremental=False
     )
     criterion = nn.SmoothL1Loss()
-
-    # 4. First-time deployment logic
-    if champion_version is None or champion_version == challenger_version:
-        logger.info(f"Promoting v{challenger_version} to '@champion' (Initial Baseline)...")
-        client.set_registered_model_alias(name=model_name, alias="champion", version=challenger_version)
-        logger.info("Model successfully crowned Champion!")
-        return
 
     # 5. Load both models for head-to-head comparison
     logger.info(f"Loading Challenger (v{challenger_version}) from MLflow...")
@@ -89,8 +101,8 @@ def evaluate_and_promote(model_name: str, table_name: str = "weather.ml_features
     champion_model = mlflow.pytorch.load_model(f"models:/{model_name}/{champion_version}", map_location=device)
 
     # 6. Execute Benchmark Arena
-    challenger_loss, challenger_rmse, challenger_mae = compute_metrics(challenger_model, val_loader, criterion)
-    champion_loss, champion_rmse, champion_mae = compute_metrics(champion_model, val_loader, criterion)
+    challenger_loss, challenger_rmse, challenger_mae = compute_metrics(challenger_model, test_loader, criterion)
+    champion_loss, champion_rmse, champion_mae = compute_metrics(champion_model, test_loader, criterion)
 
     logger.info(f"--- BENCHMARK RESULTS ---")
     logger.info(f"Champion   (v{champion_version}):   Loss={champion_loss:.4f} | RMSE={champion_rmse:.4f} | MAE={champion_mae:.4f}")

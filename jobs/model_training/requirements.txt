@@ -1,0 +1,19 @@
+pyarrow==25.0.1
+pandas==2.3.3
+numpy==2.2.6
+scipy==1.17.1
+pyiceberg[s3fs,pyarrow,pyiceberg-core]==0.11.1
+pyiceberg-core==0.8.0
+fsspec==2026.7.0
+s3fs==2026.7.0
+mlflow==3.15.1
+# boto3 is held one patch back from latest on purpose: s3fs pulls aiobotocore,
+# which pins botocore tightly. The original multi-step `pip install` in this
+# Dockerfile hid that conflict by resolving each line separately.
+boto3==1.43.56
+onnx==1.22.0
+# CPU runtime on purpose. The only CUDA-11.8 build of onnxruntime-gpu on PyPI is
+# 1.18.1, which pins numpy<2 and would drag scipy, pandas and pyarrow backwards
+# across the whole image - to accelerate a single 72x4 forward pass that takes
+# milliseconds on CPU. Training still runs on the GPU through PyTorch.
+onnxruntime==1.29.0

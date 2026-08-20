@@ -9,9 +9,9 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from data_loader import get_dataloaders
+from data_loader import DEFAULT_MAX_FEATURE_AGE_HOURS, get_dataloaders
 from models import TimeSeriesTransformer
-from trainer import get_latest_model_weights, train_and_register_model
+from trainer import get_latest_model_weights, resolve_epochs, train_and_register_model
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 torch.backends.cudnn.benchmark = True
@@ -38,12 +38,17 @@ def main():
         if prev_weights is None:
             is_incremental = False
 
-    epochs = 2 if is_incremental else 10
+    epochs = resolve_epochs(is_incremental, scratch=10, incremental=2)
     lr = 1e-4 if is_incremental else 0.001
-    warmup_epochs = 1 if is_incremental else 2
+    # Warmup has to leave at least one epoch for the cosine phase, otherwise
+    # CosineAnnealingLR gets a non-positive T_max and the schedule degenerates.
+    warmup_epochs = min(1 if is_incremental else 2, max(epochs - 1, 0))
 
-    train_loader, val_loader = get_dataloaders(
-        CONFIG["table_name"], CONFIG["seq_len"], CONFIG["pred_len"], CONFIG["batch_size"], is_incremental
+    # The test split is deliberately ignored here: it belongs to the promotion gate,
+    # and a model early-stopped on it would be benchmarked on its own tuning data.
+    train_loader, val_loader, _ = get_dataloaders(
+        CONFIG["table_name"], CONFIG["seq_len"], CONFIG["pred_len"], CONFIG["batch_size"],
+        is_incremental, max_age_hours=DEFAULT_MAX_FEATURE_AGE_HOURS
     )
 
     model = TimeSeriesTransformer(
@@ -56,9 +61,13 @@ def main():
         logger.info("Successfully warm-started model with previous weights.")
 
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=CONFIG["weight_decay"])
-    scheduler1 = optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, total_iters=warmup_epochs)
-    scheduler2 = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs - warmup_epochs, eta_min=1e-6)
-    scheduler = optim.lr_scheduler.SequentialLR(optimizer, schedulers=[scheduler1, scheduler2], milestones=[warmup_epochs])
+    if warmup_epochs > 0:
+        scheduler1 = optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, total_iters=warmup_epochs)
+        scheduler2 = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs - warmup_epochs, eta_min=1e-6)
+        scheduler = optim.lr_scheduler.SequentialLR(optimizer, schedulers=[scheduler1, scheduler2], milestones=[warmup_epochs])
+    else:
+        # A single-epoch smoke run has no room for a warmup phase.
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
 
     hyperparams = {**CONFIG, "training_mode": mode, "model_type": "Transformer", "epochs": epochs, "initial_lr": lr, "optimizer": "AdamW"}
 

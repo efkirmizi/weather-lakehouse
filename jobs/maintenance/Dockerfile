@@ -13,7 +13,6 @@ ENV PYTHONUNBUFFERED=1 \
 # -----------------------------
 # Install Java & System Utilities
 # -----------------------------
-# ADDED: wget so we can download the JARs
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         openjdk-17-jre-headless \
@@ -33,16 +32,11 @@ RUN pip install --no-cache-dir pyspark==3.5.2 py4j==0.10.9.7
 
 # -----------------------------
 # Bake Maven JARs directly into Spark
+# The Nessie extensions are what enable the CALL system procedures this job runs.
 # -----------------------------
 RUN wget https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-3.5_2.12/1.5.0/iceberg-spark-runtime-3.5_2.12-1.5.0.jar -P $SPARK_HOME/jars/ && \
     wget https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-aws-bundle/1.5.0/iceberg-aws-bundle-1.5.0.jar -P $SPARK_HOME/jars/ && \
     wget https://repo1.maven.org/maven2/org/projectnessie/nessie-integrations/nessie-spark-extensions-3.5_2.12/0.108.4/nessie-spark-extensions-3.5_2.12-0.108.4.jar -P $SPARK_HOME/jars/
-
-# -----------------------------
-# Application dependencies
-# -----------------------------
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
 
 # -----------------------------
 # Create spark user & group
@@ -54,9 +48,6 @@ RUN groupadd --system spark && \
         --home-dir /home/spark \
         spark
 
-# -----------------------------
-# Create directories Spark/Ivy needs
-# -----------------------------
 RUN mkdir -p \
         /home/spark/.ivy2/cache \
         /home/spark/.ivy2/jars \
@@ -67,12 +58,8 @@ RUN mkdir -p \
 
 WORKDIR /opt/spark/work-dir
 
-# -----------------------------
-# Copy application script
-# -----------------------------
-COPY --chown=spark:spark weather_etl.py .
+COPY --chown=spark:spark lakehouse_janitor.py .
 
 USER spark
 
-# Airflow overrides this command, but it serves as a safe default fallback
-CMD ["python3", "weather_etl.py"]
+CMD ["python3", "lakehouse_janitor.py"]

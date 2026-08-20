@@ -28,9 +28,19 @@ services:
         condition: service_healthy
     entrypoint: >
       /bin/sh -c "
+      if [ -z '${MINIO_APP_USER:-}' ] && [ -n '${MINIO_APP_PASSWORD:-}' ]; then
+        echo 'MINIO_APP_PASSWORD is set but MINIO_APP_USER is empty - every service would authenticate with a mismatched pair.' >&2; exit 1;
+      fi &&
+      if [ -n '${MINIO_APP_USER:-}' ] && [ -z '${MINIO_APP_PASSWORD:-}' ]; then
+        echo 'MINIO_APP_USER is set but MINIO_APP_PASSWORD is empty - set both or neither.' >&2; exit 1;
+      fi &&
       mc alias set local http://minio:9000 '${MINIO_ADMIN_USER}' '${MINIO_ADMIN_PASSWORD}' &&
       mc mb --ignore-existing local/warehouse &&
       mc mb --ignore-existing local/mlflow &&
+      if [ '${MINIO_APP_USER:-${MINIO_ADMIN_USER}}' != '${MINIO_ADMIN_USER}' ]; then
+        mc admin user add local '${MINIO_APP_USER:-${MINIO_ADMIN_USER}}' '${MINIO_APP_PASSWORD:-${MINIO_ADMIN_PASSWORD}}' &&
+        mc admin policy attach local readwrite --user '${MINIO_APP_USER:-${MINIO_ADMIN_USER}}' || true;
+      fi &&
       echo 'buckets ready'
       "
     restart: "no"
@@ -77,8 +87,8 @@ services:
       nessie.catalog.service.s3.default-options.path-style-access: "true"
       nessie.catalog.service.s3.default-options.auth-type: STATIC
       nessie.catalog.service.s3.default-options.access-key: urn:nessie-secret:quarkus:nessie.catalog.secrets.access-key
-      nessie.catalog.secrets.access-key.name: ${MINIO_ADMIN_USER}
-      nessie.catalog.secrets.access-key.secret: ${MINIO_ADMIN_PASSWORD}
+      nessie.catalog.secrets.access-key.name: ${MINIO_APP_USER:-${MINIO_ADMIN_USER}}
+      nessie.catalog.secrets.access-key.secret: ${MINIO_APP_PASSWORD:-${MINIO_ADMIN_PASSWORD}}
       nessie.server.authentication.enabled: "false"
     restart: unless-stopped
 
@@ -101,7 +111,8 @@ services:
 
   # 5. THE ORCHESTRATOR INIT
   airflow-init:
-    image: apache/airflow:2.10.1
+    build:
+      context: ./docker/airflow
     container_name: airflow-init
     user: "0:0" # Temporarily run as root to fix host permissions
     depends_on:
@@ -109,6 +120,10 @@ services:
         condition: service_healthy
     environment:
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@postgres-airflow:5432/${AIRFLOW_DB_NAME}
+      # Encrypts connection passwords at rest. Left empty Airflow still works, it just
+      # stores them in clear text - generate one with:
+      #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:-}
     volumes:
       - ./dags:/opt/airflow/dags
       - ./logs:/opt/airflow/logs
@@ -123,12 +138,15 @@ services:
         su airflow -c "
           airflow db migrate &&
           airflow users create --username ${_AIRFLOW_WWW_USER_USERNAME} --password ${_AIRFLOW_WWW_USER_PASSWORD} --firstname Admin --lastname User --role Admin --email admin@example.com || true &&
-          airflow pools set single_gpu 2 'Limit concurrency for GPU and heavy ETL tasks'
+          airflow pools set single_gpu 1 'Serializes GPU work: this host has one GPU and every GPU task requests all of them' &&
+          airflow connections delete minio_s3 2>/dev/null || true &&
+          airflow connections add minio_s3 --conn-type generic --conn-login '${MINIO_APP_USER:-${MINIO_ADMIN_USER}}' --conn-password '${MINIO_APP_PASSWORD:-${MINIO_ADMIN_PASSWORD}}' --conn-description 'S3 credentials the DockerOperator jobs receive as AWS_* env vars'
         "
 
   # 6. THE ORCHESTRATOR COMPONENTS
   airflow-webserver:
-    image: apache/airflow:2.10.1
+    build:
+      context: ./docker/airflow
     container_name: airflow-webserver
     user: "50000:0"
     restart: unless-stopped
@@ -138,28 +156,24 @@ services:
       airflow-init:
         condition: service_completed_successfully
     environment:
-      _PIP_ADDITIONAL_REQUIREMENTS: 'apache-airflow-providers-docker'
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@postgres-airflow:5432/${AIRFLOW_DB_NAME}
       AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
       AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
-      AWS_ACCESS_KEY_ID: ${MINIO_ADMIN_USER}
-      AWS_SECRET_ACCESS_KEY: ${MINIO_ADMIN_PASSWORD}
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:-}
     volumes:
       - ./dags:/opt/airflow/dags
       - ./logs:/opt/airflow/logs
-      - /var/run/docker.sock:/var/run/docker.sock
     command: webserver
     healthcheck:
       test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
       interval: 30s
       timeout: 10s
       retries: 5
-    group_add:
-      - "${DOCKER_GID}"
 
   airflow-scheduler:
-    image: apache/airflow:2.10.1
+    build:
+      context: ./docker/airflow
     container_name: airflow-scheduler
     user: "50000:0"
     restart: unless-stopped
@@ -167,12 +181,16 @@ services:
       airflow-init:
         condition: service_completed_successfully
     environment:
-      _PIP_ADDITIONAL_REQUIREMENTS: 'apache-airflow-providers-docker'
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@postgres-airflow:5432/${AIRFLOW_DB_NAME}
       AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
-      AWS_ACCESS_KEY_ID: ${MINIO_ADMIN_USER}
-      AWS_SECRET_ACCESS_KEY: ${MINIO_ADMIN_PASSWORD}
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:-}
+      # The S3 keys are no longer here: jobs receive them from the minio_s3 Airflow
+      # connection, rendered per task run (see dags/credentials.py).
+      # Passed through to the drift monitor container so it can trigger retraining
+      # without a credential hardcoded in the job source.
+      AIRFLOW_API_USER: ${_AIRFLOW_WWW_USER_USERNAME}
+      AIRFLOW_API_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD}
     volumes:
       - ./dags:/opt/airflow/dags
       - ./logs:/opt/airflow/logs
@@ -183,21 +201,58 @@ services:
     
   # 7. THE MLOPS TRACKING SERVER
   mlflow:
-    image: python:3.11-slim
+    build:
+      context: ./docker/mlflow
     container_name: mlflow
+    restart: unless-stopped
     ports:
       - "5000:5000"
     environment:
-      - AWS_ACCESS_KEY_ID=${MINIO_ADMIN_USER}
-      - AWS_SECRET_ACCESS_KEY=${MINIO_ADMIN_PASSWORD}
+      - AWS_ACCESS_KEY_ID=${MINIO_APP_USER:-${MINIO_ADMIN_USER}}
+      - AWS_SECRET_ACCESS_KEY=${MINIO_APP_PASSWORD:-${MINIO_ADMIN_PASSWORD}}
       - MLFLOW_S3_ENDPOINT_URL=http://minio:9000
-    command: bash -c "pip install --no-cache-dir mlflow boto3 && mlflow server --host 0.0.0.0 --port 5000 --backend-store-uri sqlite:////mlflow/mlflow.db --default-artifact-root s3://mlflow/ --allowed-hosts '*'"
+    command: >
+      mlflow server --host 0.0.0.0 --port 5000
+      --backend-store-uri sqlite:////mlflow/mlflow.db
+      --default-artifact-root s3://mlflow/
+      --allowed-hosts '*'
     volumes:
       - mlflow_data:/mlflow
     depends_on:
-      - minio-init
-    networks:
-      default:
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    
+  # 8. FASTAPI BACKEND STREAMLIT FRONTEND DASHBOARD
+  lakehouse-serving:
+    build: 
+      context: ./jobs/serving
+      dockerfile: Dockerfile
+    container_name: lakehouse_serving_ui
+    restart: unless-stopped
+    ports:
+      - "8000:8000"   # FastAPI Backend
+      - "8501:8501"   # Streamlit Frontend
+    environment:
+      - AWS_ACCESS_KEY_ID=${MINIO_APP_USER:-${MINIO_ADMIN_USER}}
+      - AWS_SECRET_ACCESS_KEY=${MINIO_APP_PASSWORD:-${MINIO_ADMIN_PASSWORD}}
+      - API_URL=http://localhost:8000
+    depends_on:
+      minio:
+        condition: service_healthy
+      nessie:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
 
 volumes:
   minio_data:

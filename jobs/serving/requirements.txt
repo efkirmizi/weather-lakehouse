@@ -1,0 +1,16 @@
+fastapi==0.141.1
+uvicorn==0.52.3
+streamlit==1.61.1
+pyiceberg[s3fs,pyarrow]==0.11.1
+pandas==3.0.5
+plotly==6.9.0
+requests==2.34.2
+# Pinned even though they are transitive: pyiceberg[s3fs] pulls aiobotocore, which
+# constrains botocore tightly. Leaving them free is how the model_training image
+# ended up with a set pip could not reproduce in a single pass.
+pyiceberg-core==0.8.0
+fsspec==2026.7.0
+s3fs==2026.7.0
+aiobotocore==3.9.0
+botocore==1.43.56
+pyarrow==24.0.0

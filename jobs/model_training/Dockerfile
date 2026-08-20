@@ -3,17 +3,10 @@ FROM pytorch/pytorch:2.7.1-cuda11.8-cudnn9-runtime
 
 WORKDIR /app
 
-# 1. Upgrade pip first
-RUN pip install --upgrade pip
+RUN pip install --no-cache-dir --upgrade pip
 
-# 2. Install base data tools
-RUN pip install pyarrow pandas numpy
-
-# 3. Install Iceberg separately
-RUN pip install pyiceberg[s3fs]
-
-# 4. Install MLflow and Boto3 last
-RUN pip install mlflow boto3
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . ./
 

@@ -1,0 +1,6 @@
+# Imported by the training DAG files; defines no DAG itself, so parsing it is wasted
+# work. .airflowignore only excludes it from DagBag scanning - it stays importable
+# because Airflow puts the dags folder on sys.path.
+training_dag_factory.py
+alerting.py
+credentials.py

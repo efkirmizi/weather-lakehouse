@@ -9,9 +9,9 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from data_loader import get_dataloaders
+from data_loader import DEFAULT_MAX_FEATURE_AGE_HOURS, get_dataloaders
 from models import ConvLSTMWeatherForecaster
-from trainer import get_latest_model_weights, train_and_register_model
+from trainer import get_latest_model_weights, resolve_epochs, train_and_register_model
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 torch.backends.cudnn.benchmark = True
@@ -37,11 +37,14 @@ def main():
         if prev_weights is None:
             is_incremental = False
 
-    epochs = 2 if is_incremental else 10
+    epochs = resolve_epochs(is_incremental, scratch=10, incremental=2)
     lr = 1e-4 if is_incremental else 0.001
 
-    train_loader, val_loader = get_dataloaders(
-        CONFIG["table_name"], CONFIG["seq_len"], CONFIG["pred_len"], CONFIG["batch_size"], is_incremental
+    # The test split is deliberately ignored here: it belongs to the promotion gate,
+    # and a model early-stopped on it would be benchmarked on its own tuning data.
+    train_loader, val_loader, _ = get_dataloaders(
+        CONFIG["table_name"], CONFIG["seq_len"], CONFIG["pred_len"], CONFIG["batch_size"],
+        is_incremental, max_age_hours=DEFAULT_MAX_FEATURE_AGE_HOURS
     )
 
     model = ConvLSTMWeatherForecaster(
