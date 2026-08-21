@@ -15,18 +15,29 @@ logger = logging.getLogger("ML_Training")
 # run instead of a fresh random one.
 DEFAULT_SEED = 1337
 
-# Chronological three-way split: train | validation | test, oldest to newest.
+# The timeline is cut into four chronological blocks, oldest to newest:
+#
+#   [------- train -------][-- val --][-- test --][ adapt ]
+#
 # Validation drives early stopping, so it cannot also be the promotion benchmark -
-# the challenger would be judged on data it was tuned against. The test slice is
-# never read during training.
+# the challenger would be judged on data it was tuned against. The test block is
+# never read during training, in either mode.
 VAL_FRACTION = 0.15
 TEST_FRACTION = 0.15
 
-# Incremental runs mix recent windows with a replay buffer. Capped relative to the
-# recent set: an uncapped 5% of all history buried the 14 days we actually want to
-# adapt to under ~38k historical windows, i.e. under 1% of every batch.
-REPLAY_PER_RECENT = 4
+# The newest RECENT_WINDOWS hours: what an incremental run adapts to. Carved out of
+# the timeline *before* the split above, which is what lets the two requirements
+# coexist - incremental needs the newest data, the gate needs a block nothing was
+# fitted on. Splitting the incremental selection instead put every one of these
+# windows into the val/test slices training discards, so incremental runs learned
+# from nothing but their replay buffer.
 RECENT_WINDOWS = 24 * 14
+
+# Replay buffer, capped relative to the recent set: an uncapped 5% of all history
+# buried the 14 days we actually want to adapt to under ~38k historical windows,
+# i.e. under 1% of every batch.
+REPLAY_PER_RECENT = 4
+REPLAY_POOL_FRACTION = 0.05
 
 # Training runs on a weekly cron, not on a feature-table event, so nothing stops it
 # from retraining on data that stopped arriving days ago. The archive API lags a
@@ -147,25 +158,59 @@ def chronological_split(indices, seq_len, pred_len,
     return train_indices, val_indices, test_indices
 
 
-def _select_indices(total_windows, is_incremental, seed):
-    if not is_incremental:
-        logger.info(f"Scratch mode: Training on ALL {total_windows} historical windows.")
-        return list(range(total_windows))
+def split_windows(total_windows, seq_len, pred_len,
+                  val_fraction=VAL_FRACTION, test_fraction=TEST_FRACTION,
+                  recent_windows=RECENT_WINDOWS):
+    """Chronological blocks over the whole timeline: (train, val, test, adapt).
 
-    recent_indices = list(range(max(0, total_windows - RECENT_WINDOWS), total_windows))
-    historical_pool = list(range(0, max(0, total_windows - RECENT_WINDOWS)))
-
-    budget = len(recent_indices) * REPLAY_PER_RECENT
-    sample_size = min(int(len(historical_pool) * 0.05), budget)
-    # Seeded so a rerun of the same DAG run trains on the same replay buffer.
-    rng = random.Random(seed)
-    replay_indices = rng.sample(historical_pool, sample_size) if historical_pool else []
-
-    logger.info(
-        f"Incremental mode: {len(recent_indices)} recent + {sample_size} replay windows "
-        f"(capped at {REPLAY_PER_RECENT}x recent)."
+    `adapt` is the newest `recent_windows` windows and belongs to incremental runs;
+    everything older is split into the three blocks the gate depends on.
+    """
+    adapt_start = max(0, total_windows - recent_windows)
+    adapt = list(range(adapt_start, total_windows))
+    train, val, test = chronological_split(
+        range(adapt_start), seq_len, pred_len, val_fraction, test_fraction
     )
-    return sorted(recent_indices + replay_indices)
+    return train, val, test, adapt
+
+
+def _replay_sample(train_block, recent_count, seed):
+    """Historical windows mixed in with the recent ones to limit forgetting.
+
+    Sampled from the train block alone. Drawing from the whole timeline, as this used
+    to, puts windows the promotion gate scores on into the training set.
+    """
+    pool = list(train_block)
+    budget = recent_count * REPLAY_PER_RECENT
+    sample_size = min(int(len(pool) * REPLAY_POOL_FRACTION), budget, len(pool))
+    # Seeded so a rerun of the same DAG run trains on the same replay buffer.
+    return random.Random(seed).sample(pool, sample_size)
+
+
+def plan_windows(total_windows, seq_len, pred_len, is_incremental, seed=DEFAULT_SEED):
+    """Window indices this run trains on, validates on, and is benchmarked against.
+
+    Validation and test are the same blocks in both modes. Validation because it keeps
+    `val_*` comparable across runs and because measuring an incremental run against
+    held-out history is exactly how the catastrophic forgetting the replay buffer
+    guards against would show up; test because a mode-dependent benchmark block would
+    score champion and challenger on different windows.
+    """
+    train_block, val_block, test_block, adapt_block = split_windows(
+        total_windows, seq_len, pred_len
+    )
+
+    if not is_incremental:
+        logger.info(f"Scratch mode: training on all {len(train_block)} windows before the holdout.")
+        return train_block, val_block, test_block
+
+    replay = _replay_sample(train_block, len(adapt_block), seed)
+    train_indices = sorted(adapt_block + replay)
+    logger.info(
+        f"Incremental mode: {len(adapt_block)} recent + {len(replay)} replay windows "
+        f"({len(adapt_block) / len(train_indices):.0%} of the mix is recent)."
+    )
+    return train_indices, val_block, test_block
 
 
 def get_dataloaders(table_name, seq_len, pred_len, batch_size, is_incremental,
@@ -181,8 +226,9 @@ def get_dataloaders(table_name, seq_len, pred_len, batch_size, is_incremental,
     if max_age_hours is not None:
         assert_features_fresh(full_dataset.latest_timestamp, max_age_hours)
 
-    selected_indices = _select_indices(len(full_dataset), is_incremental, seed)
-    train_indices, val_indices, test_indices = chronological_split(selected_indices, seq_len, pred_len)
+    train_indices, val_indices, test_indices = plan_windows(
+        len(full_dataset), seq_len, pred_len, is_incremental, seed
+    )
     logger.info(
         f"Chronological split: {len(train_indices)} train / {len(val_indices)} validation "
         f"/ {len(test_indices)} test windows."

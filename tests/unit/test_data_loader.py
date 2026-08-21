@@ -6,8 +6,9 @@ from data_loader import (
     REPLAY_PER_RECENT,
     RECENT_WINDOWS,
     IcebergTimeSeriesDataset,
-    _select_indices,
     chronological_split,
+    plan_windows,
+    split_windows,
 )
 
 SEQ, PRED = 72, 24
@@ -63,21 +64,18 @@ def test_contiguous_starts_handles_too_little_data():
     assert IcebergTimeSeriesDataset._contiguous_starts(_hours(0, 1), 4).size == 0
 
 
-def test_replay_buffer_is_capped_relative_to_recent_windows():
-    selected = _select_indices(100_000, is_incremental=True, seed=1337)
-    replay = len(selected) - RECENT_WINDOWS
-    assert replay <= RECENT_WINDOWS * REPLAY_PER_RECENT
-    # the whole point: recent data must not be a rounding error in the batch mix
-    assert RECENT_WINDOWS / len(selected) > 0.15
-
-
 def test_replay_selection_is_deterministic():
-    assert _select_indices(100_000, True, 1337) == _select_indices(100_000, True, 1337)
-    assert _select_indices(100_000, True, 1337) != _select_indices(100_000, True, 7)
+    """A rerun of the same DAG run must train on the same replay buffer."""
+    same = plan_windows(100_000, SEQ, PRED, True, seed=1337)[0]
+    assert same == plan_windows(100_000, SEQ, PRED, True, seed=1337)[0]
+    assert same != plan_windows(100_000, SEQ, PRED, True, seed=7)[0]
 
 
-def test_scratch_mode_uses_every_window():
-    assert _select_indices(500, is_incremental=False, seed=1337) == list(range(500))
+def test_scratch_mode_trains_on_the_whole_train_block():
+    train_block, val_block, test_block, adapt = split_windows(100_000, SEQ, PRED)
+    train, val, test = plan_windows(100_000, SEQ, PRED, is_incremental=False)
+    assert (train, val, test) == (train_block, val_block, test_block)
+    assert not set(train) & set(adapt)
 
 
 def test_fresh_features_pass_the_guard():
@@ -100,3 +98,56 @@ def test_naive_timestamps_are_treated_as_utc():
     import datetime as dt
     naive_recent = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None) - dt.timedelta(hours=1)
     assert_features_fresh(naive_recent, max_age_hours=72)
+
+
+# --- the composed split -------------------------------------------------------
+#
+# The blind spot that let a real bug through: every test above checks _select_indices
+# or chronological_split on its own, and both were individually correct. The defect
+# lived in their composition - the recent windows sort last, so the split pushed all
+# 336 of them into the val and test slices that training discards, and an incremental
+# run fitted nothing but its historical replay buffer.
+
+REAL_TABLE_WINDOWS = 759_330  # weather.ml_features as of 2026-08-20
+
+
+def test_incremental_run_trains_on_the_newest_windows():
+    """The 14 days an incremental run exists to adapt to must reach the optimizer."""
+    train, _, _ = plan_windows(REAL_TABLE_WINDOWS, SEQ, PRED, is_incremental=True)
+    newest = set(range(REAL_TABLE_WINDOWS - RECENT_WINDOWS, REAL_TABLE_WINDOWS))
+    assert newest <= set(train)
+
+
+def test_recent_windows_are_not_a_rounding_error_in_the_incremental_mix():
+    """Why REPLAY_PER_RECENT exists, asserted on the mix training actually receives."""
+    train, _, _ = plan_windows(REAL_TABLE_WINDOWS, SEQ, PRED, is_incremental=True)
+    recent = sum(1 for i in train if i >= REAL_TABLE_WINDOWS - RECENT_WINDOWS)
+    assert recent / len(train) > 0.15
+
+
+def test_incremental_training_never_touches_the_promotion_test_block():
+    """The gate scores on the test block, so no mode may fit any window in it."""
+    *_, gate_block = plan_windows(REAL_TABLE_WINDOWS, SEQ, PRED, is_incremental=False)
+    train, val, _ = plan_windows(REAL_TABLE_WINDOWS, SEQ, PRED, is_incremental=True)
+    assert not (set(train) | set(val)) & set(gate_block)
+
+
+def test_the_benchmark_block_is_identical_in_both_modes():
+    """evaluate_and_promote always asks for the scratch split; a mode-dependent test
+    block would score champion and challenger on different windows."""
+    *_, scratch_block = plan_windows(REAL_TABLE_WINDOWS, SEQ, PRED, is_incremental=False)
+    *_, incremental_block = plan_windows(REAL_TABLE_WINDOWS, SEQ, PRED, is_incremental=True)
+    assert scratch_block == incremental_block
+
+
+def test_replay_buffer_stays_within_its_cap():
+    """Uncapped, 5% of 86 years of history drowns the 14 days being adapted to."""
+    train, _, _ = plan_windows(REAL_TABLE_WINDOWS, SEQ, PRED, is_incremental=True)
+    replay = sum(1 for i in train if i < REAL_TABLE_WINDOWS - RECENT_WINDOWS)
+    assert replay <= RECENT_WINDOWS * REPLAY_PER_RECENT
+
+
+def test_adapt_block_is_the_newest_windows_and_disjoint_from_the_rest():
+    train, val, test, adapt = split_windows(REAL_TABLE_WINDOWS, SEQ, PRED)
+    assert adapt == list(range(REAL_TABLE_WINDOWS - RECENT_WINDOWS, REAL_TABLE_WINDOWS))
+    assert max(train) < min(val) and max(val) < min(test) and max(test) < min(adapt)
