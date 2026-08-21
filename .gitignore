@@ -35,3 +35,6 @@ webserver_config.py
 .env
 *.env
 .aws/
+
+# Claude
+PROJECT_CONTEXT.md
