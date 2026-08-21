@@ -1,7 +1,7 @@
 import logging
 import os
 import time
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Optional, Tuple
 
 import openmeteo_requests
 import pandas as pd
@@ -63,16 +63,19 @@ def create_spark_session() -> SparkSession:
         .getOrCreate()
     )
 
-def get_watermark(spark: SparkSession) -> pd.Timestamp:
-    """Queries Iceberg to find the latest timestamp we have data for."""
+def get_watermark(spark: SparkSession) -> Optional[pd.Timestamp]:
+    """Newest timestamp already in the table, or None when there is nothing yet.
+
+    None rather than EARLIEST_DATA_DATE so callers can tell "empty table" from "we
+    genuinely hold the 1940-01-01 00:00 row" - drop_already_ingested would otherwise
+    discard that first hour on the very first run.
+    """
     catalog, database, _ = TABLE_NAME.split(".")
     spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {catalog}.{database}")
     
-    table_exists = spark.catalog.tableExists(TABLE_NAME)
-    
-    if not table_exists:
+    if not spark.catalog.tableExists(TABLE_NAME):
         logger.info(f"Table {TABLE_NAME} does not exist. Starting from {EARLIEST_DATA_DATE}.")
-        return pd.to_datetime(EARLIEST_DATA_DATE, utc=True)
+        return None
     
     try:
         max_date_row = spark.sql(f"SELECT MAX(timestamp) as max_ts FROM {TABLE_NAME}").collect()[0]
@@ -81,13 +84,20 @@ def get_watermark(spark: SparkSession) -> pd.Timestamp:
             logger.info(f"Found existing data. Latest timestamp is {latest_ts}.")
             return latest_ts
     except Exception as e:
-        logger.warning(f"Could not read max timestamp, defaulting to {EARLIEST_DATA_DATE}. Reason: {e}")
-        
-    return pd.to_datetime(EARLIEST_DATA_DATE, utc=True)
+        logger.warning(f"Could not read max timestamp, starting from {EARLIEST_DATA_DATE}. Reason: {e}")
 
-def generate_date_chunks(start_ts: pd.Timestamp) -> List[Tuple[str, str]]:
-    """Calculates missing date ranges and chunks them into 5-year increments to prevent API timeouts."""
-    start_date = (start_ts + pd.Timedelta(hours=1)).date()
+    return None
+
+def generate_date_chunks(watermark: Optional[pd.Timestamp]) -> List[Tuple[str, str]]:
+    """Missing date ranges, in 5-year increments to prevent API timeouts.
+
+    A watermark short of 23:00 re-fetches its own day, because the archive API only
+    serves whole days. drop_already_ingested is what stops that becoming duplicates.
+    """
+    if watermark is None:
+        start_date = pd.to_datetime(EARLIEST_DATA_DATE, utc=True).date()
+    else:
+        start_date = (watermark + pd.Timedelta(hours=1)).date()
     # Open-Meteo Historical API is safely available up to "yesterday"
     end_date = (pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=1)).date()
     
@@ -143,6 +153,22 @@ def transform_weather_data(response: Any) -> pd.DataFrame:
     # Drop any null rows just in case the API returned gaps for very old dates
     df.dropna(inplace=True)
     return df
+
+def drop_already_ingested(df: pd.DataFrame, watermark: Optional[pd.Timestamp]) -> pd.DataFrame:
+    """Removes rows the table already holds.
+
+    The archive API only serves whole days, so a chunk starting from a mid-day
+    watermark comes back carrying hours that are already ingested. That happens
+    whenever transform_weather_data drops a NaN tail and leaves the watermark short of
+    23:00. load_to_lakehouse is a plain append with no primary key, so re-appending
+    them duplicates rows outright: the feature job's row-count invariant then forces a
+    full rebuild, and every training window spanning a duplicated hour is thrown away
+    as a discontinuity.
+    """
+    if watermark is None:
+        return df
+    return df[df["timestamp"] > watermark]
+
 
 def run_data_quality_checks(df: pd.DataFrame) -> None:
     """Runs strict data quality assertions before Lakehouse ingestion."""
@@ -204,15 +230,26 @@ def main() -> None:
         for start_str, end_str in date_chunks:
             # 1. EXTRACT
             response = extract_weather_chunk(API_URL, DEFAULT_PARAMS, start_str, end_str)
-            
+
             # 2a. TRANSFORM
             pandas_df = transform_weather_data(response)
-            
-            # 2b. DATA QUALITY GATE
+
+            # 2b. DROP WHAT WE ALREADY HAVE
+            pandas_df = drop_already_ingested(pandas_df, watermark)
+            if pandas_df.empty:
+                logger.info(
+                    f"Chunk {start_str} -> {end_str} holds nothing newer than {watermark}. Skipping."
+                )
+                continue
+
+            # 2c. DATA QUALITY GATE
             run_data_quality_checks(pandas_df)
-            
+
             # 3. LOAD
             load_to_lakehouse(spark, pandas_df)
+            # Advance so the next chunk is measured against what was just committed,
+            # not against the watermark this run started with.
+            watermark = pandas_df["timestamp"].max()
             logger.info(f"Successfully committed chunk {start_str} -> {end_str} to Iceberg.")
 
             # ADD THIS SLEEP: Pause for seconds to respect Open-Meteo's rate limits
