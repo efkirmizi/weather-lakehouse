@@ -30,6 +30,9 @@ MIN_BASELINE_SAMPLES = int(os.getenv("DRIFT_MIN_BASELINE_SAMPLES", "336"))
 # Do not retrain a DAG that already started within this window. Each trigger is a
 # from-scratch run of a full model; without a cooldown a warm spell retrains daily.
 COOLDOWN_HOURS = float(os.getenv("DRIFT_COOLDOWN_HOURS", "168"))
+# How far back to look for the newest row before falling back to a full scan. 01 runs
+# daily, so on any healthy stack the anchor is found in a few thousand rows.
+ANCHOR_PROBE_DAYS = int(os.getenv("DRIFT_ANCHOR_PROBE_DAYS", "30"))
 AIRFLOW_BASE_URL = os.getenv("AIRFLOW_BASE_URL", "http://airflow-webserver:8080")
 # Every model behind the pipeline should react to drift, not just the Transformer.
 RETRAIN_DAG_IDS = [
@@ -111,6 +114,31 @@ def trigger_retraining():
             logger.error(f"API connection failed for '{dag_id}': {e}")
 
 
+def latest_timestamp(table):
+    """Newest timestamp in the feature table, or None if it holds nothing.
+
+    Probes a recent window before reading everything. Scanning the whole timestamp
+    column - which is what this did - is the same unbounded read that climatology_filter
+    exists to avoid, only one column wide.
+    """
+    since = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=ANCHOR_PROBE_DAYS)
+    probe = table.scan(
+        row_filter=GreaterThanOrEqual("timestamp", since.isoformat()),
+        selected_fields=("timestamp",),
+    ).to_arrow()
+    if probe.num_rows:
+        return pd.to_datetime(probe.column("timestamp").to_pandas().max(), utc=True)
+
+    logger.warning(
+        f"No feature rows in the last {ANCHOR_PROBE_DAYS} days - 01 may have stopped. "
+        "Falling back to a full scan to find the anchor."
+    )
+    everything = table.scan(selected_fields=("timestamp",)).to_arrow()
+    if everything.num_rows == 0:
+        return None
+    return pd.to_datetime(everything.column("timestamp").to_pandas().max(), utc=True)
+
+
 def climatology_filter(anchor: pd.Timestamp):
     """Row filter covering this time of year across the last BASELINE_YEARS years.
 
@@ -137,11 +165,10 @@ def main():
 
     # The newest timestamp anchors the seasonal window; read it first so the main
     # scan can be bounded instead of pulling the entire table.
-    latest_row = table.scan(selected_fields=("timestamp",)).to_arrow()
-    if latest_row.num_rows == 0:
+    anchor = latest_timestamp(table)
+    if anchor is None:
         logger.info("Feature table is empty. Skipping.")
         sys.exit(0)
-    anchor = pd.to_datetime(latest_row.column("timestamp").to_pandas().max(), utc=True)
 
     df = table.scan(row_filter=climatology_filter(anchor)).to_arrow().to_pandas()
     if df.empty:
