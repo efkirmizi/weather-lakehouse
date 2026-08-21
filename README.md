@@ -221,6 +221,10 @@ Every decision is also logged against two forecasts that need no training —
 what makes the champion's RMSE readable. A model that cannot beat seasonal-naive on an
 hourly weather series is not forecasting, it is reproducing the diurnal cycle badly.
 
+All four are scored by `score_predictors` in a **single** walk of the test block. They
+see identical windows by construction, so a pass per predictor would have quadrupled
+the cost of a task bounded at 15 minutes for no added information.
+
 ## Forecast idempotency
 
 `04` is Dataset-triggered and `02` emits its outlet even on a no-op run, so the same
@@ -299,16 +303,25 @@ dependencies, with `tests/` mounted.
 
 | Suite | Where | What it protects |
 |---|---|---|
-| `tests/static` | any Python 3.11 | DAG discoverability, function-local import shadowing, syntax. No dependencies, instant. |
-| `tests/airflow` | the Airflow image | Parses `dags/` exactly as the scheduler does: import errors, one DAG per file, failure callbacks, GPU tasks inside the pool. |
-| `tests/unit` | training / ETL / feature-engineering / serving images | Window splitting and its *composition* into a run's train/val/test sets, gap filtering, replay caps, warm-start version selection, MLflow client configuration, epoch overrides, the ETL watermark guard, the drift anchor probe, rebuild-vs-append decisions, forecast/residual selection, timestamp literals. |
+| `tests/static` | any Python 3.11 | DAG discoverability, function-local import shadowing, suite registration, syntax. No dependencies, instant. |
+| `tests/airflow` | the Airflow image | Parses `dags/` exactly as the scheduler does: import errors, one DAG per file, failure callbacks, GPU tasks inside the pool, deprecated arguments. |
+| `tests/unit` | training / ETL / feature-engineering / serving images | Window splitting and its *composition* into a run's train/val/test sets, gap filtering, replay caps, warm-start version selection, MLflow client configuration, epoch overrides, single-pass benchmark scoring, the ETL watermark guard, the drift anchor probe, rebuild-vs-append decisions, forecast/residual selection, timestamp literals. |
 
-The two static checks exist because both failures actually happened here. A DAG file
+Each static check exists because that failure actually happened here. A DAG file
 that mentions neither "airflow" nor "dag" is skipped by `DAG_DISCOVERY_SAFE_MODE`
-**with no import error** — the DAG just disappears. And an `import mlflow.pytorch`
+**with no import error** — the DAG just disappears. An `import mlflow.pytorch`
 inside an `except` block makes `mlflow` function-local, so an earlier
 `mlflow.onnx.load_model(...)` in the same function raises `UnboundLocalError` and
-silently disables the whole ONNX serving path.
+silently disables the whole ONNX serving path. And because `dev.sh` and `ci.yml`
+enumerate the unit test files they run by hand, a new one is executed nowhere until
+both lists are updated — which is how the training suites spent their whole life
+running on a single laptop.
+
+The DAG suite fails on any deprecation warning raised from `dags/`, because a
+deprecated argument is not an error yet. `auto_remove=True` was the live case:
+providers-docker 3.13.0 converted the bool to `'success'` and warned, so asserting
+on `task.auto_remove` would have seen nothing wrong — the warning was the only
+signal, and a later release turns it into a parse-time `ValueError`.
 
 CI (`.github/workflows/ci.yml`) runs the static checks with no Docker at all, then
 builds the light images for the rest. The training suites are the exception and run on
