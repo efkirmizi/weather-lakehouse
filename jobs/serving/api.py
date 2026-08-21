@@ -19,6 +19,9 @@ logger = logging.getLogger("Serving_API")
 # has ever produced the table, and a permanent 0/1 fallback silently turns every
 # temperature on the dashboard into a normalized number.
 SCALING_TTL_SECONDS = 300
+# Shorter while the table is still missing, so a cold start picks it up quickly
+# without turning every single request into a catalog round-trip.
+SCALING_RETRY_SECONDS = 30
 _scaling_cache = {"temperature": (0.0, 1.0)}
 _scaling_loaded_at = 0.0
 _scaling_is_real = False
@@ -68,8 +71,11 @@ def refresh_scaling_parameters(force: bool = False) -> None:
     """Reloads the normalization statistics if the cache is cold or stale."""
     global _scaling_loaded_at, _scaling_is_real
 
-    fresh_enough = (time.time() - _scaling_loaded_at) < SCALING_TTL_SECONDS
-    if not force and _scaling_is_real and fresh_enough:
+    # Both outcomes are cached. Before this, a failure left _scaling_is_real False and
+    # the check never short-circuited, so every request re-hit the catalog until 02 had
+    # run for the first time - the timestamp the failure branch records was dead code.
+    ttl = SCALING_TTL_SECONDS if _scaling_is_real else SCALING_RETRY_SECONDS
+    if not force and (time.time() - _scaling_loaded_at) < ttl:
         return
 
     try:
@@ -133,8 +139,12 @@ def get_latest_forecast():
         if df.empty:
             return {"status": f"no forecasts in the last {FORECAST_LOOKBACK_DAYS} days"}
 
-        latest_run = df['created_at'].max()
-        latest_df = df[df['created_at'] == latest_run].copy()
+        # Per model, not one global max. `04` skips a champion whose forecast for this
+        # window is already stored, so the two models' rows routinely carry different
+        # created_at values - and a global max then charts only whichever was written
+        # last, silently dropping the other from the comparison.
+        newest_per_model = df.groupby('model_name')['created_at'].transform('max')
+        latest_df = df[df['created_at'] == newest_per_model].copy()
 
         # DE-NORMALIZE the target variable using dynamically loaded parameters
         latest_df['target_variable'] = latest_df['predicted_features'].apply(lambda x: denormalize(x[0]))
@@ -166,7 +176,9 @@ def get_residuals():
 
         # One row per (hour, model, version). Re-runs used to append an identical copy
         # of the same forecast; keeping them would only inflate the sample count.
-        preds_df = preds_df.drop_duplicates(
+        # Sorted first because Iceberg guarantees no row order and 05's compaction
+        # reshuffles data files: without it `keep='last'` picks an arbitrary row.
+        preds_df = preds_df.sort_values('created_at').drop_duplicates(
             subset=['forecast_timestamp', 'model_name', 'model_version'], keep='last'
         )
 
