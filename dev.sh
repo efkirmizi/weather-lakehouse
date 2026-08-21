@@ -54,7 +54,11 @@ test_dags() {
 test_unit() {
     echo ">> unit tests: training image"
     run_pytest dag-pytorch-model-training:1.0 /app \
-        /tests/unit/test_data_loader.py /tests/unit/test_trainer.py
+        /tests/unit/test_data_loader.py /tests/unit/test_trainer.py \
+        /tests/unit/test_drift_monitor.py
+    echo ">> unit tests: weather ETL image"
+    run_pytest dag-pyspark-etl:1.0 /opt/spark/work-dir \
+        /tests/unit/test_weather_etl.py
     echo ">> unit tests: feature engineering image"
     run_pytest dag-pyspark-feature-engineering:1.0 /opt/spark/work-dir \
         /tests/unit/test_feature_engineering.py

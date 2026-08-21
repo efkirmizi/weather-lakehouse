@@ -50,6 +50,14 @@ jobs:
             -e PYTHONPATH=/opt/spark/work-dir fe-ci \
             sh -c "pip install -q pytest && python -m pytest /tests/unit/test_feature_engineering.py -q -p no:cacheprovider"
 
+      - name: Build weather ETL image
+        run: docker build -t etl-ci ./jobs/weather_etl
+      - name: Weather ETL tests
+        run: |
+          docker run --rm --user root -v "$PWD/tests":/tests \
+            -e PYTHONPATH=/opt/spark/work-dir etl-ci \
+            sh -c "pip install -q pytest && python -m pytest /tests/unit/test_weather_etl.py -q -p no:cacheprovider"
+
       - name: Build serving image
         run: docker build -t serving-ci ./jobs/serving
       - name: Serving tests
@@ -58,6 +66,26 @@ jobs:
             -e PYTHONPATH=/app serving-ci \
             sh -c "pip install -q pytest && python -m pytest /tests/unit/test_serving.py -q -p no:cacheprovider"
 
-  # dag-pytorch-model-training is ~11GB (CUDA base) and does not fit a hosted runner's
-  # disk budget. Its suite - tests/unit/test_data_loader.py and test_trainer.py - runs
-  # via `./dev.sh test-unit` locally, or here if a self-hosted runner is added.
+  # The training suites used to run nowhere but a developer's laptop, because
+  # dag-pytorch-model-training is ~11GB (CUDA base) and does not fit a hosted runner.
+  # They never needed the image: window planning, epoch resolution, registry selection
+  # and the drift anchor touch no GPU and no live MLflow, so CPU wheels run them.
+  # This is where every regression test for the split and warm-start bugs lives.
+  training:
+    name: training logic (CPU wheels, no CUDA image)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install CPU torch plus the job's own pinned dependencies
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch==2.7.1
+          pip install -r jobs/model_training/requirements.txt pytest
+      - name: Training unit tests
+        run: |
+          PYTHONPATH=jobs/model_training python -m pytest \
+            tests/unit/test_data_loader.py \
+            tests/unit/test_trainer.py \
+            tests/unit/test_drift_monitor.py -q
