@@ -32,8 +32,11 @@ with DAG(
             **s3_env(),
             # Forwarded from the scheduler so the monitor can call the Airflow API
             # without a credential baked into the image.
-            "AIRFLOW_API_USER": os.getenv("AIRFLOW_API_USER"),
-            "AIRFLOW_API_PASSWORD": os.getenv("AIRFLOW_API_PASSWORD"),
+            # Defaulted rather than None: DockerOperator renders a None value as a
+            # bare, valueless env var. drift_monitor already refuses to run with empty
+            # credentials and says so, which is a far clearer failure.
+            "AIRFLOW_API_USER": os.getenv("AIRFLOW_API_USER", ""),
+            "AIRFLOW_API_PASSWORD": os.getenv("AIRFLOW_API_PASSWORD", ""),
         },
         command="python drift_monitor.py",
         docker_url="unix://var/run/docker.sock",

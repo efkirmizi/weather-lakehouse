@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.datasets import Dataset
 from airflow.providers.docker.operators.docker import DockerOperator
@@ -38,4 +38,8 @@ with DAG(
         docker_url="unix://var/run/docker.sock",
         outlets=[ml_features_dataset],
         retries=0,
+        # Every other DockerOperator here is bounded; this one was not, so a Spark job
+        # that hung held the slot indefinitely. An incremental run takes well under a
+        # minute and a full rebuild renormalizes the whole table, so an hour is slack.
+        execution_timeout=timedelta(hours=1),
     )
