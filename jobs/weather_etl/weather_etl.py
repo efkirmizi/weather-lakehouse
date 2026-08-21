@@ -17,8 +17,11 @@ logging.basicConfig(
 logger = logging.getLogger("WeatherLakehouse")
 
 # Configuration Constants
-ICEBERG_VERSION = "1.5.0"
-NESSIE_VERSION = "0.108.4"
+# The Iceberg and Nessie JARs are baked into $SPARK_HOME/jars by the Dockerfile.
+# Do not reintroduce a spark.jars.packages config: it makes Spark run an Ivy
+# resolution and re-download every JAR on each run regardless of what is already
+# on the classpath - ~200MB per container, plus a hard dependency on Maven
+# Central being reachable. Bump the versions in the Dockerfile instead.
 # The Historical API uses a different endpoint than the forecast API
 API_URL = "https://archive-api.open-meteo.com/v1/archive"
 TABLE_NAME = "nessie.weather.observations"
@@ -42,11 +45,6 @@ def create_spark_session() -> SparkSession:
     return (
         SparkSession.builder
         .appName("WeatherLakehouseHistorical")
-        .config("spark.jars.packages", ",".join([
-            f"org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:{ICEBERG_VERSION}",
-            f"org.apache.iceberg:iceberg-aws-bundle:{ICEBERG_VERSION}",
-            f"org.projectnessie.nessie-integrations:nessie-spark-extensions-3.5_2.12:{NESSIE_VERSION}",
-        ]))
         .config("spark.sql.extensions",
                 "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions,"
                 "org.projectnessie.spark.extensions.NessieSparkSessionExtensions")

@@ -1,4 +1,4 @@
-pyspark==3.5.2
-py4j==0.10.9.7
+# pyspark/py4j are pinned in the Dockerfile: the baked Iceberg/Nessie JARs
+# live inside PySpark's install directory, so that layer must come first.
 pandas==3.0.5
 numpy==2.4.6
