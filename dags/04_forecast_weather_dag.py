@@ -26,7 +26,7 @@ with DAG(
         task_id="monitor_concept_drift",
         image="dag-pytorch-model-training:1.0",
         api_version="auto",
-        auto_remove=True,
+        auto_remove="success",
         network_mode="lakehouse-net",
         environment={
             **s3_env(),
@@ -49,7 +49,7 @@ with DAG(
         task_id="generate_multi_model_forecasts",
         image="dag-pytorch-model-training:1.0",
         api_version="auto",
-        auto_remove=True,
+        auto_remove="success",
         network_mode="lakehouse-net",
         environment={
             **s3_env(),

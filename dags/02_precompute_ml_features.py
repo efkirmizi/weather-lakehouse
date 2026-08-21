@@ -25,7 +25,7 @@ with DAG(
         task_id="run_pyspark_feature_engineering",
         image="dag-pyspark-feature-engineering:1.0",
         api_version="auto",
-        auto_remove=True,
+        auto_remove="success",
         network_mode="lakehouse-net",
         environment={
             **s3_env(),

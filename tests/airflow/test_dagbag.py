@@ -5,6 +5,7 @@ DagBag applies DAG_DISCOVERY_SAFE_MODE, so a file the scheduler would silently s
 shows up here as a missing DAG rather than as an import error.
 """
 import pathlib
+import warnings
 
 from airflow.models import DagBag
 
@@ -55,3 +56,31 @@ def test_gpu_tasks_are_serialized_by_the_pool():
             if getattr(task, "device_requests", None) and task.pool != "single_gpu":
                 offenders.append(f"{dag_id}.{task.task_id}")
     assert not offenders, f"GPU tasks outside the single_gpu pool: {offenders}"
+
+
+def test_no_dag_file_uses_a_deprecated_argument():
+    """A deprecated argument still parses, so nothing fails - it only warns.
+
+    `auto_remove=True` is the live example: providers-docker 3.13.0 converts the bool
+    to 'success' and warns, and a later release drops the conversion and raises
+    ValueError at parse time instead. Asserting on `task.auto_remove` cannot catch
+    that, because by the time the operator exists the value has already been
+    converted - the warning is the only signal, so this is what has to be asserted on.
+
+    Scoped to warnings raised *from* dags/. Airflow 2.10.1's own dependency stack
+    (Flask, marshmallow, SQLAlchemy) emits four more that we cannot act on, and
+    failing this suite on those would only teach everyone to ignore it.
+    """
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        DagBag(str(DAGS_DIR), include_examples=False)
+
+    offenders = sorted({
+        f"{pathlib.Path(w.filename).name}:{w.lineno} - {w.category.__name__}: {w.message}"
+        for w in caught
+        if issubclass(w.category, DeprecationWarning)
+        and pathlib.Path(w.filename).parent == DAGS_DIR
+    })
+    assert not offenders, (
+        "DAG files use deprecated arguments:\n  " + "\n  ".join(offenders)
+    )

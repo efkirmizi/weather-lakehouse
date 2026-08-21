@@ -34,7 +34,7 @@ with DAG(
         task_id="run_nessie_gc",
         image="dag-nessie-gc:1.0",
         api_version="auto",
-        auto_remove=True,
+        auto_remove="success",
         network_mode="lakehouse-net",
         environment={
             **s3_env(),

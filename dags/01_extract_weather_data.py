@@ -24,7 +24,7 @@ with DAG(
         task_id="run_pyspark_etl",
         image="dag-pyspark-etl:1.0",
         api_version="auto",
-        auto_remove=True,
+        auto_remove="success",
         network_mode="lakehouse-net",
         environment=s3_env(),
         command="python3 /opt/spark/work-dir/weather_etl.py",

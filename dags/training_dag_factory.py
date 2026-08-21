@@ -59,7 +59,7 @@ def _training_task(task_id: str, script: str, mode: str, timeout: timedelta) -> 
         task_id=task_id,
         image=TRAINING_IMAGE,
         api_version="auto",
-        auto_remove=True,
+        auto_remove="success",
         network_mode="lakehouse-net",
         environment={
             **s3_env(),
@@ -106,7 +106,7 @@ def build_training_dag(dag_id: str, model_name: str, script: str, description: s
             task_id="evaluate_and_promote_model",
             image=TRAINING_IMAGE,
             api_version="auto",
-            auto_remove=True,
+            auto_remove="success",
             network_mode="lakehouse-net",
             environment={
                 **s3_env(),

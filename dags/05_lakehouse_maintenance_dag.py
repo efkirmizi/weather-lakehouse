@@ -32,7 +32,7 @@ with DAG(
         map_index_template="{{ task.environment['MAINTENANCE_TABLE'] }}",
         image="dag-lakehouse-janitor:1.0",
         api_version="auto",
-        auto_remove=True,
+        auto_remove="success",
         network_mode="lakehouse-net",
         # The script is baked into the image, like every other job here. A bind
         # mount would be resolved by the Docker daemon against the *host* filesystem,
