@@ -31,44 +31,64 @@ class Scores(NamedTuple):
     window_mse: "object"   # np.ndarray, one mean squared error per test window
 
 
-def compute_metrics(predict, dataloader, criterion):
-    """Evaluates any batch -> prediction callable and computes Loss, RMSE and MAE.
+class _Running:
+    """Per-predictor accumulators for one pass over the loader."""
 
-    A callable rather than a model so the naive baselines, which have no forward pass,
-    are scored by exactly the same code on exactly the same windows.
+    def __init__(self):
+        self.loss = 0.0
+        self.sq_error = 0.0
+        self.abs_error = 0.0
+        self.elements = 0
+        self.window_mse = []
+
+
+def score_predictors(predictors, dataloader, criterion):
+    """Scores every predictor in a single pass, returning {name: Scores}.
+
+    Champion, challenger and the naive baselines are all scored on identical windows,
+    so walking the test block once per predictor multiplied the cost of this task by
+    four for nothing - and the block is ~113k windows inside a 15-minute timeout.
+
+    Callables rather than models, so the baselines, which have no forward pass, go
+    through exactly the same code as the two networks.
 
     RMSE is the real thing - sqrt of the mean squared error - not sqrt of the
     SmoothL1 objective, and both errors are accumulated over elements so a short
     final batch does not get the same weight as a full one.
     """
-    total_loss = 0.0
-    sq_error_sum = 0.0
-    abs_error_sum = 0.0
-    element_count = 0
-    window_mse = []
+    if not predictors:
+        return {}
+
+    running = {name: _Running() for name in predictors}
 
     with torch.no_grad():
         for x_val, y_val in dataloader:
             x_val = x_val.to(device, non_blocking=True)
             y_val = y_val.to(device, non_blocking=True)
 
-            preds = predict(x_val)
-            total_loss += criterion(preds, y_val).item()
+            for name, predict in predictors.items():
+                acc = running[name]
+                preds = predict(x_val)
+                acc.loss += criterion(preds, y_val).item()
 
-            diff = preds.float() - y_val.float()
-            sq_error_sum += torch.sum(diff * diff).item()
-            abs_error_sum += torch.sum(diff.abs()).item()
-            element_count += diff.numel()
-            # One error per window, kept for the paired promotion test. The loader is
-            # unshuffled, so these stay aligned across models.
-            window_mse.append((diff * diff).mean(dim=(1, 2)).cpu())
+                diff = preds.float() - y_val.float()
+                acc.sq_error += torch.sum(diff * diff).item()
+                acc.abs_error += torch.sum(diff.abs()).item()
+                acc.elements += diff.numel()
+                # One error per window, kept for the paired promotion test. The loader
+                # is unshuffled, so these stay aligned across predictors.
+                acc.window_mse.append((diff * diff).mean(dim=(1, 2)).cpu())
 
-    return Scores(
-        loss=total_loss / len(dataloader),
-        rmse=math.sqrt(sq_error_sum / element_count),
-        mae=abs_error_sum / element_count,
-        window_mse=torch.cat(window_mse).numpy(),
-    )
+    batches = len(dataloader)
+    return {
+        name: Scores(
+            loss=acc.loss / batches,
+            rmse=math.sqrt(acc.sq_error / acc.elements),
+            mae=acc.abs_error / acc.elements,
+            window_mse=torch.cat(acc.window_mse).numpy(),
+        )
+        for name, acc in running.items()
+    }
 
 def evaluate_and_promote(model_name: str, table_name: str = "weather.ml_features"):
     os.environ["MLFLOW_S3_ENDPOINT_URL"] = "http://minio:9000"
@@ -121,19 +141,24 @@ def evaluate_and_promote(model_name: str, table_name: str = "weather.ml_features
     logger.info(f"Loading Champion (v{champion_version}) from MLflow...")
     champion_model = mlflow.pytorch.load_model(f"models:/{model_name}/{champion_version}", map_location=device)
 
-    # 6. Execute Benchmark Arena
+    # 6. Execute Benchmark Arena. One pass over the test block scores all four:
+    # both models, plus two forecasts that were never trained. The baselines gate
+    # nothing - they are here so the numbers above can be read at all. A champion
+    # that cannot beat seasonal-naive is not a forecaster.
     challenger_model.eval()
     champion_model.eval()
-    challenger = compute_metrics(challenger_model, test_loader, criterion)
-    champion = compute_metrics(champion_model, test_loader, criterion)
-
-    # 6b. The same windows, forecast by two models that were never trained. Neither
-    # promotion decision depends on these - they are here so the numbers above can be
-    # read at all. A champion that cannot beat seasonal-naive is not a forecaster.
-    naive = {
-        name: compute_metrics(lambda x, f=fn: f(x, PRED_LEN), test_loader, criterion)
-        for name, fn in NAIVE_FORECASTS.items()
-    }
+    scores = score_predictors(
+        {
+            "champion": champion_model,
+            "challenger": challenger_model,
+            **{name: (lambda x, f=fn: f(x, PRED_LEN)) for name, fn in NAIVE_FORECASTS.items()},
+        },
+        test_loader,
+        criterion,
+    )
+    champion = scores["champion"]
+    challenger = scores["challenger"]
+    naive = {name: scores[name] for name in NAIVE_FORECASTS}
 
     logger.info(f"--- BENCHMARK RESULTS ---")
     logger.info(f"Champion   (v{champion_version}):   Loss={champion.loss:.4f} | RMSE={champion.rmse:.4f} | MAE={champion.mae:.4f}")
