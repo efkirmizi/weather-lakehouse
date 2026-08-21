@@ -151,23 +151,41 @@ Drift is measured as a fraction of the feature's own standard deviation rather t
 of its mean, so a near-zero mean like precipitation does not force a rebuild every
 time it rains.
 
-## Train / validation / test
+## Train / validation / test / adapt
 
-`get_dataloaders` cuts the windows chronologically into three blocks — oldest to
-newest — and drops the windows that straddle each cut, because consecutive windows
-share all but one of their timesteps and a random split would hand the later blocks
+`split_windows` cuts the timeline into four chronological blocks — oldest to newest —
+and drops the windows that straddle each cut, because consecutive windows share all
+but one of their timesteps and a random split would hand the later blocks
 near-duplicates of the training rows.
 
-| Block | Share | Used by |
+| Block | Size | Used by |
 |---|---|---|
-| train | 70% | gradient updates |
-| validation | 15% | early stopping, `val_*` metrics |
+| train | 70% | gradient updates on a scratch run; the replay buffer on an incremental one |
+| validation | 15% | early stopping and `val_*` metrics, in both modes |
 | test | 15% | the promotion gate, and nothing else |
+| adapt | newest 14 days | incremental runs, and nothing else |
+
+The percentages are of the timeline *minus* the adapt block. Carving those newest
+hours out first is what lets two conflicting requirements coexist: an incremental run
+exists to learn from the newest data, and the gate has to score on windows that
+neither model was fitted on.
+
+Splitting the incremental *selection* instead — the original approach — looks
+equivalent and is not. The recent windows sort last, so all 336 of them fell into the
+val and test slices that training discards: an incremental run fitted nothing but its
+historical replay buffer, while 156 of its validation windows sat inside the block the
+gate scores on. Both `_select_indices` and `chronological_split` were individually
+correct; only their composition was wrong, which is why the tests now assert on
+`plan_windows` rather than on either half.
 
 The gate needs its own block: a challenger early-stopped on the validation split
 would otherwise be benchmarked on the data it was tuned against. `evaluate_and_promote`
 also runs in fp32 — the threshold is a 1% RMSE improvement and observed margins have
 been ~0.2%, which is inside mixed-precision noise.
+
+Validation is deliberately the same block in both modes. It keeps `val_*` comparable
+between runs, and scoring an incremental run against held-out history is exactly how
+the catastrophic forgetting its replay buffer guards against would surface.
 
 Windows that span a gap in the hourly series are skipped entirely. The ETL only warns
 about gaps (the Open-Meteo archive genuinely has holes in the older decades), so
@@ -254,7 +272,7 @@ dependencies, with `tests/` mounted.
 |---|---|---|
 | `tests/static` | any Python 3.11 | DAG discoverability, function-local import shadowing, syntax. No dependencies, instant. |
 | `tests/airflow` | the Airflow image | Parses `dags/` exactly as the scheduler does: import errors, one DAG per file, failure callbacks, GPU tasks inside the pool. |
-| `tests/unit` | training / feature-engineering / serving images | Window splitting, gap filtering, replay caps, epoch overrides, rebuild-vs-append decisions, timestamp literals. |
+| `tests/unit` | training / ETL / feature-engineering / serving images | Window splitting and its *composition* into a run's train/val/test sets, gap filtering, replay caps, warm-start version selection, MLflow client configuration, epoch overrides, the ETL watermark guard, the drift anchor probe, rebuild-vs-append decisions, forecast/residual selection, timestamp literals. |
 
 The two static checks exist because both failures actually happened here. A DAG file
 that mentions neither "airflow" nor "dag" is skipped by `DAG_DISCOVERY_SAFE_MODE`
@@ -264,8 +282,11 @@ inside an `except` block makes `mlflow` function-local, so an earlier
 silently disables the whole ONNX serving path.
 
 CI (`.github/workflows/ci.yml`) runs the static checks with no Docker at all, then
-builds the light images for the rest. The 11 GB CUDA training image does not fit a
-hosted runner, so its suite runs through `./dev.sh test-unit`.
+builds the light images for the rest. The training suites are the exception and run on
+plain CPU wheels: the 11 GB CUDA image does not fit a hosted runner, but nothing they
+assert — window planning, epoch resolution, registry selection, the drift anchor —
+touches a GPU or a live MLflow server. That job is where every regression test for the
+split and warm-start bugs lives, so it is the one that must not be dropped.
 
 ## Operations
 
@@ -282,6 +303,13 @@ hosted runner, so its suite runs through `./dev.sh test-unit`.
   without this a broken ETL produces a confident model trained on last week's world.
 - **Maintenance fan-out.** `05` maps one task per table, so a failure on one does not
   force re-running compaction on the others.
+- **Spark JARs are baked, not resolved.** The Iceberg and Nessie JARs live in
+  `$SPARK_HOME/jars` in each Spark image. None of the three jobs sets
+  `spark.jars.packages`: that config makes Spark run an Ivy resolution and re-download
+  every JAR on each run whatever is already on the classpath, which cost ~200MB per
+  container — `02` is dataset-triggered on every `01` and its container is
+  auto-removed, so the cache was cold every time — and made Maven Central a hard
+  runtime dependency. Bump the versions in the Dockerfiles.
 
 ## Timestamps
 
