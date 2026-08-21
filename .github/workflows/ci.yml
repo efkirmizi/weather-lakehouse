@@ -88,4 +88,6 @@ jobs:
           PYTHONPATH=jobs/model_training python -m pytest \
             tests/unit/test_data_loader.py \
             tests/unit/test_trainer.py \
-            tests/unit/test_drift_monitor.py -q
+            tests/unit/test_drift_monitor.py \
+            tests/unit/test_baselines.py \
+            tests/unit/test_promotion.py -q

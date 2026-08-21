@@ -2,6 +2,7 @@ import os
 import sys
 import math
 import logging
+from typing import NamedTuple
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("Model_Evaluation")
@@ -13,6 +14,7 @@ import mlflow.pytorch
 from mlflow.tracking import MlflowClient
 from baselines import NAIVE_FORECASTS
 from data_loader import get_dataloaders
+from promotion import promotion_verdict
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -21,6 +23,13 @@ PRED_LEN = 24
 # Deliberately no autocast here, unlike training. The promotion threshold is 1% and
 # the observed margins have been ~0.2%, which is inside fp16 noise - a benchmark that
 # decides deployments has to be reproducible.
+
+class Scores(NamedTuple):
+    loss: float
+    rmse: float
+    mae: float
+    window_mse: "object"   # np.ndarray, one mean squared error per test window
+
 
 def compute_metrics(predict, dataloader, criterion):
     """Evaluates any batch -> prediction callable and computes Loss, RMSE and MAE.
@@ -36,6 +45,7 @@ def compute_metrics(predict, dataloader, criterion):
     sq_error_sum = 0.0
     abs_error_sum = 0.0
     element_count = 0
+    window_mse = []
 
     with torch.no_grad():
         for x_val, y_val in dataloader:
@@ -49,11 +59,16 @@ def compute_metrics(predict, dataloader, criterion):
             sq_error_sum += torch.sum(diff * diff).item()
             abs_error_sum += torch.sum(diff.abs()).item()
             element_count += diff.numel()
+            # One error per window, kept for the paired promotion test. The loader is
+            # unshuffled, so these stay aligned across models.
+            window_mse.append((diff * diff).mean(dim=(1, 2)).cpu())
 
-    avg_loss = total_loss / len(dataloader)
-    rmse = math.sqrt(sq_error_sum / element_count)
-    mae = abs_error_sum / element_count
-    return avg_loss, rmse, mae
+    return Scores(
+        loss=total_loss / len(dataloader),
+        rmse=math.sqrt(sq_error_sum / element_count),
+        mae=abs_error_sum / element_count,
+        window_mse=torch.cat(window_mse).numpy(),
+    )
 
 def evaluate_and_promote(model_name: str, table_name: str = "weather.ml_features"):
     os.environ["MLFLOW_S3_ENDPOINT_URL"] = "http://minio:9000"
@@ -109,24 +124,24 @@ def evaluate_and_promote(model_name: str, table_name: str = "weather.ml_features
     # 6. Execute Benchmark Arena
     challenger_model.eval()
     champion_model.eval()
-    challenger_loss, challenger_rmse, challenger_mae = compute_metrics(challenger_model, test_loader, criterion)
-    champion_loss, champion_rmse, champion_mae = compute_metrics(champion_model, test_loader, criterion)
+    challenger = compute_metrics(challenger_model, test_loader, criterion)
+    champion = compute_metrics(champion_model, test_loader, criterion)
 
-    # 6b. The same windows, forecast by two models that were never trained. No
+    # 6b. The same windows, forecast by two models that were never trained. Neither
     # promotion decision depends on these - they are here so the numbers above can be
     # read at all. A champion that cannot beat seasonal-naive is not a forecaster.
     naive = {
-        name: compute_metrics(lambda x, f=fn: f(x, PRED_LEN), test_loader, criterion)[1:]
+        name: compute_metrics(lambda x, f=fn: f(x, PRED_LEN), test_loader, criterion)
         for name, fn in NAIVE_FORECASTS.items()
     }
 
     logger.info(f"--- BENCHMARK RESULTS ---")
-    logger.info(f"Champion   (v{champion_version}):   Loss={champion_loss:.4f} | RMSE={champion_rmse:.4f} | MAE={champion_mae:.4f}")
-    logger.info(f"Challenger (v{challenger_version}): Loss={challenger_loss:.4f} | RMSE={challenger_rmse:.4f} | MAE={challenger_mae:.4f}")
-    for name, (rmse, mae) in naive.items():
-        skill = 1.0 - (champion_rmse / rmse) if rmse else float("nan")
+    logger.info(f"Champion   (v{champion_version}):   Loss={champion.loss:.4f} | RMSE={champion.rmse:.4f} | MAE={champion.mae:.4f}")
+    logger.info(f"Challenger (v{challenger_version}): Loss={challenger.loss:.4f} | RMSE={challenger.rmse:.4f} | MAE={challenger.mae:.4f}")
+    for name, scores in naive.items():
+        skill = 1.0 - (champion.rmse / scores.rmse) if scores.rmse else float("nan")
         logger.info(
-            f"Baseline   ({name}): RMSE={rmse:.4f} | MAE={mae:.4f} "
+            f"Baseline   ({name}): RMSE={scores.rmse:.4f} | MAE={scores.mae:.4f} "
             f"| champion skill vs it: {skill:+.1%}"
         )
 
@@ -137,28 +152,46 @@ def evaluate_and_promote(model_name: str, table_name: str = "weather.ml_features
             "champion_version": champion_version,
             "challenger_version": challenger_version,
         })
-        mlflow.log_metrics({
-            "champion_rmse": champion_rmse,
-            "champion_mae": champion_mae,
-            "challenger_rmse": challenger_rmse,
-            "challenger_mae": challenger_mae,
-            "rmse_diff": challenger_rmse - champion_rmse,
-            **{f"baseline_{n}_rmse": r for n, (r, _) in naive.items()},
-            **{f"baseline_{n}_mae": m for n, (_, m) in naive.items()},
+        metrics = {
+            "champion_rmse": champion.rmse,
+            "champion_mae": champion.mae,
+            "challenger_rmse": challenger.rmse,
+            "challenger_mae": challenger.mae,
+            "rmse_diff": challenger.rmse - champion.rmse,
+        }
+        for name, scores in naive.items():
+            metrics[f"baseline_{name}_rmse"] = scores.rmse
+            metrics[f"baseline_{name}_mae"] = scores.mae
             # Positive means the model beats the baseline; negative means it does not.
-            **{f"champion_skill_vs_{n}": 1.0 - (champion_rmse / r) for n, (r, _) in naive.items() if r},
-            **{f"challenger_skill_vs_{n}": 1.0 - (challenger_rmse / r) for n, (r, _) in naive.items() if r},
-        })
+            if scores.rmse:
+                metrics[f"champion_skill_vs_{name}"] = 1.0 - (champion.rmse / scores.rmse)
+                metrics[f"challenger_skill_vs_{name}"] = 1.0 - (challenger.rmse / scores.rmse)
 
-        # 8. Promotion Threshold Decision (1% improvement required or equal/better)
-        PROMOTION_THRESHOLD = 0.99  # Challenger RMSE must be <= 99% of Champion RMSE
-        if challenger_rmse <= (champion_rmse * PROMOTION_THRESHOLD):
-            logger.info(f"PROMOTION SUCCESSFUL! Challenger v{challenger_version} beat Champion v{champion_version}.")
+        # 8. Promotion decision: a floor worth deploying for, and a paired test on
+        # disjoint windows. See promotion.py for why a fixed percentage was wrong.
+        verdict = promotion_verdict(champion.window_mse, challenger.window_mse,
+                                    stride=SEQ_LEN + PRED_LEN)
+        metrics["promotion_relative_improvement"] = verdict.relative_improvement
+        metrics["promotion_p_value"] = verdict.p_value
+        metrics["promotion_disjoint_windows"] = float(verdict.samples)
+        mlflow.log_metrics(metrics)
+
+        if verdict.promote:
+            logger.info(f"PROMOTION SUCCESSFUL! Challenger v{challenger_version} beat Champion v{champion_version}: {verdict.reason}.")
             client.set_registered_model_alias(name=model_name, alias="champion", version=challenger_version)
             client.set_registered_model_alias(name=model_name, alias="previous_champion", version=champion_version)
+            # A re-evaluated version can carry a stale rejection from an earlier run;
+            # leaving it makes the registry claim the same version is both champion
+            # and rejected.
+            try:
+                stale = client.get_model_version_by_alias(name=model_name, alias="challenger_rejected")
+                if str(stale.version) == challenger_version:
+                    client.delete_registered_model_alias(name=model_name, alias="challenger_rejected")
+            except Exception:
+                pass
             mlflow.log_param("promotion_decision", "PROMOTED")
         else:
-            logger.warning(f"PROMOTION REJECTED. Challenger v{challenger_version} failed to outperform Champion v{champion_version}.")
+            logger.warning(f"PROMOTION REJECTED. Challenger v{challenger_version} stays behind Champion v{champion_version}: {verdict.reason}.")
             client.set_registered_model_alias(name=model_name, alias="challenger_rejected", version=challenger_version)
             mlflow.log_param("promotion_decision", "REJECTED")
 

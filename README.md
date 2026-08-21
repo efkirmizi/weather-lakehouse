@@ -97,8 +97,8 @@ weather.observations ──Dataset──► 02_precompute_ml_features
                      │  on drift: triggers 03a AND 03b               │
                      │  with conf TRAINING_MODE=SCRATCH              ▼
                      ▼                                       evaluate_and_promote
-            generate_multi_model_forecasts                    challenger RMSE ≤ 99% of
-            every @champion, via ONNX Runtime                 champion on the TEST split
+            generate_multi_model_forecasts                    paired test on the TEST
+            every @champion, via ONNX Runtime                 split, vs naive baselines
             (skipped if already forecast)                     → new @champion
                      ▼
         weather.forecast_predictions ──► FastAPI ──► Streamlit
@@ -180,8 +180,8 @@ correct; only their composition was wrong, which is why the tests now assert on
 
 The gate needs its own block: a challenger early-stopped on the validation split
 would otherwise be benchmarked on the data it was tuned against. `evaluate_and_promote`
-also runs in fp32 — the threshold is a 1% RMSE improvement and observed margins have
-been ~0.2%, which is inside mixed-precision noise.
+also runs in fp32 — the margins it decides on are ~0.2%, well inside mixed-precision
+noise, and a benchmark that decides deployments has to be reproducible.
 
 Validation is deliberately the same block in both modes. It keeps `val_*` comparable
 between runs, and scoring an incremental run against held-out history is exactly how
@@ -191,6 +191,35 @@ Windows that span a gap in the hourly series are skipped entirely. The ETL only 
 about gaps (the Open-Meteo archive genuinely has holes in the older decades), so
 `IcebergTimeSeriesDataset` filters them and `batch_inference` refuses to forecast from
 a discontinuous context window.
+
+## Promotion
+
+A challenger takes the `@champion` alias when its improvement is **worth deploying for
+and unlikely to be noise** — two separate questions, asked separately.
+
+| Check | Default | Why |
+|---|---|---|
+| relative RMSE improvement | ≥ 0.1% | below this it is not worth a deployment however reliable |
+| paired one-sided t-test | p < 0.05 | the improvement has to survive being tested window by window |
+
+This replaced a flat "challenger RMSE ≤ 99% of champion". That threshold was
+unreachable: a warm-started incremental run improves by ~0.2%, so once warm-starting
+began working the gate would have rejected every challenger it ever saw and
+`@champion` would have frozen at the last from-scratch run. A fixed percentage also
+asks the wrong question — it waves through a large gap that is pure noise and blocks a
+small one that is perfectly consistent.
+
+The test is paired because both models are scored on identical windows, and it is run
+on a **subsample**: consecutive test windows share all but one of their 96 hours, so
+~113k windows carry nowhere near 113k independent observations. Taking one window per
+horizon leaves ~1,186 that share no timestep. Feeding the whole block to a t-test would
+report overwhelming significance for anything at all.
+
+Every decision is also logged against two forecasts that need no training —
+`persistence` (every future hour equals the last observed one) and `seasonal_naive`
+(every future hour equals the same hour yesterday). They do not gate anything; they are
+what makes the champion's RMSE readable. A model that cannot beat seasonal-naive on an
+hourly weather series is not forecasting, it is reproducing the diurnal cycle badly.
 
 ## Forecast idempotency
 
