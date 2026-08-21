@@ -11,7 +11,7 @@ import torch.optim as optim
 
 from data_loader import DEFAULT_MAX_FEATURE_AGE_HOURS, get_dataloaders
 from models import TimeSeriesTransformer
-from trainer import get_latest_model_weights, resolve_epochs, train_and_register_model
+from trainer import get_champion_weights, resolve_epochs, train_and_register_model
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 torch.backends.cudnn.benchmark = True
@@ -34,7 +34,7 @@ def main():
 
     prev_weights = None
     if is_incremental:
-        prev_weights = get_latest_model_weights(CONFIG["model_registry_name"], device)
+        prev_weights = get_champion_weights(CONFIG["model_registry_name"], device)
         if prev_weights is None:
             is_incremental = False
 
@@ -69,7 +69,14 @@ def main():
         # A single-epoch smoke run has no room for a warmup phase.
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
 
-    hyperparams = {**CONFIG, "training_mode": mode, "model_type": "Transformer", "epochs": epochs, "initial_lr": lr, "optimizer": "AdamW"}
+    hyperparams = {
+        **CONFIG,
+        # See train_lstm.py: the effective mode, not the requested one.
+        "training_mode": "INCREMENTAL" if is_incremental else "SCRATCH",
+        "requested_mode": mode,
+        "warm_started": prev_weights is not None,
+        "model_type": "Transformer", "epochs": epochs, "initial_lr": lr, "optimizer": "AdamW",
+    }
 
     train_and_register_model(
         model=model, 

@@ -13,6 +13,23 @@ from lakehouse import ONNX_ARTIFACT_NAME, ONNX_OPSET
 
 logger = logging.getLogger("ML_Training")
 
+MLFLOW_TRACKING_URI = "http://mlflow:5000"
+S3_ENDPOINT_URL = "http://minio:9000"
+
+
+def _configure_mlflow() -> None:
+    """Point this process at the tracking server and at MinIO.
+
+    Every entry point that touches the registry has to call this first. A bare
+    MlflowClient() resolves to the container's own ./mlruns, which in an ephemeral job
+    container is always empty: the lookup then reports "no model registered" however
+    healthy the server is, and artifact downloads go to real AWS S3 instead of MinIO.
+    That is exactly how warm-starting failed silently - the branch operator queries the
+    REST API directly and saw the model, the training container did not.
+    """
+    os.environ["MLFLOW_S3_ENDPOINT_URL"] = S3_ENDPOINT_URL
+    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+
 
 def resolve_epochs(is_incremental: bool, scratch: int, incremental: int) -> int:
     """Epoch budget for this run, overridable per DAG run via TRAINING_EPOCHS.
@@ -39,24 +56,31 @@ def resolve_epochs(is_incremental: bool, scratch: int, incremental: int) -> int:
     return value
 
 
-def get_latest_model_weights(registry_name, device):
-    """Fetches the latest registered model from MLflow, or returns None if starting from scratch."""
+def get_champion_weights(registry_name, device):
+    """Weights to warm-start an incremental run from, or None to train from scratch.
+
+    Deliberately the '@champion' alias rather than the newest registered version. A
+    challenger that fails the promotion gate is still registered, so resuming from
+    max(version) builds on a model the gate has already rejected - and compounds it
+    every week, since the next rejected challenger becomes the next warm start. The
+    champion is the only version the pipeline has evidence for.
+    """
+    _configure_mlflow()
     client = MlflowClient()
     try:
-        versions = client.search_model_versions(f"name='{registry_name}'")
-        if not versions:
-            logger.info("No existing model found in MLflow Registry. Training from scratch (Tabula Rasa).")
-            return None
-
-        latest_version = max(versions, key=lambda v: int(v.version))
-        logger.info(f"Found existing model: Version {latest_version.version}. Preparing for Incremental Learning.")
-
-        model_uri = f"models:/{registry_name}/{latest_version.version}"
-        prev_model = mlflow.pytorch.load_model(model_uri, map_location=device)
-        return prev_model.state_dict()
-
+        champion = client.get_model_version_by_alias(name=registry_name, alias="champion")
     except Exception as e:
-        logger.info(f"Could not load previous model from registry ({e}). Training from scratch.")
+        logger.info(f"No '@champion' alias on '{registry_name}' ({e}). Training from scratch.")
+        return None
+
+    logger.info(f"Warm-starting from '{registry_name}@champion' (version {champion.version}).")
+    try:
+        model = mlflow.pytorch.load_model(
+            f"models:/{registry_name}/{champion.version}", map_location=device
+        )
+        return model.state_dict()
+    except Exception as e:
+        logger.info(f"Could not load the champion's weights ({e}). Training from scratch.")
         return None
 
 
@@ -79,8 +103,7 @@ def train_and_register_model(
     train_loader, val_loader, optimizer, scheduler, criterion,
     epochs, patience, device, hyperparams_dict
 ):
-    os.environ["MLFLOW_S3_ENDPOINT_URL"] = "http://minio:9000"
-    mlflow.set_tracking_uri("http://mlflow:5000")
+    _configure_mlflow()
     mlflow.set_experiment(experiment_name)
 
     temp_model_path = f"{model_registry_name}_best_temp.pth"
