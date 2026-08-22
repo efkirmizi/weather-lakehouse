@@ -65,6 +65,12 @@ On a cold start the DAGs run themselves in order — `01` is `@daily` and everyt
 downstream is triggered by Iceberg Datasets. The first `01` run backfills from
 1940-01-01 in five-year chunks and takes a while.
 
+**Training is the exception.** `03a` and `03b` are on a weekly cron, so a freshly
+created stack has no registered model until the next Sunday 02:00. Until one exists,
+`04` writes no forecasts and the dashboard has nothing to chart — both endpoints
+report the empty state rather than an error. Trigger a training DAG by hand if you do
+not want to wait for the cron.
+
 To smoke-test a pipeline change without waiting for a full training budget, trigger a
 training DAG with a run config:
 
