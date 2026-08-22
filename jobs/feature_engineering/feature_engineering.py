@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
@@ -16,10 +17,56 @@ SOURCE_TABLE = "nessie.weather.observations"
 TARGET_TABLE = "nessie.weather.ml_features"
 SCALING_TABLE = "nessie.weather.scaling_parameters"
 
-FEATURE_COLS = ["temperature_c", "humidity_percent", "precipitation_mm", "wind_speed_kmh"]
-# Names the serving layer looks these up by; order matches FEATURE_COLS and the
-# position of each value inside the ml_features vector.
-SERVING_FEATURE_NAMES = ["temperature", "humidity", "precipitation", "wind_speed"]
+# THE feature vector, in order, declared once. Five functions in this file used to
+# each carry a piece of this knowledge; with three kinds of channel that scatters
+# badly, and the layout is what README calls load-bearing.
+#
+# Channels 0-3 keep their identity and position forever: the serving API reads
+# channel 0 as temperature from an image with no copy of this layout, and
+# drift_monitor/evaluate_and_promote read it through TEMPERATURE_CHANNEL, which
+# only agrees with this file by convention.
+SCALED_COLUMNS = [
+    # (source column, channel name)
+    ("temperature_c",           "temperature"),
+    ("humidity_percent",        "humidity"),
+    ("precipitation_mm",        "precipitation"),
+    ("wind_speed_kmh",          "wind_speed"),
+    ("pressure_msl_hpa",        "pressure"),
+    ("dew_point_c",             "dew_point"),
+    ("cloud_cover_percent",     "cloud_cover"),
+    ("shortwave_radiation_wm2", "shortwave_radiation"),
+    ("soil_temperature_c",      "soil_temperature"),
+    ("soil_moisture_m3m3",      "soil_moisture"),
+]
+
+# Emitted as sin/cos pairs, never standardized: a compass bearing and a clock are
+# circular, so on a linear scale 359 and 1 sit at opposite extremes and 23:00 looks
+# maximally far from midnight. Each contributes two channels, already in [-1, 1].
+CYCLICAL_CHANNELS = [
+    # (name prefix, period, raw value)
+    ("wind_dir", 360.0,  lambda: F.coalesce(F.col("wind_direction_deg"), F.lit(0.0))),
+    ("hour",      24.0,  lambda: F.hour("timestamp")),
+    ("doy",      365.25, lambda: F.dayofyear("timestamp")),
+]
+
+FEATURE_COLS = [column for column, _ in SCALED_COLUMNS]
+SERVING_FEATURE_NAMES = (
+    [name for _, name in SCALED_COLUMNS]
+    + [f"{name}_{part}" for name, _, _ in CYCLICAL_CHANNELS for part in ("sin", "cos")]
+)
+
+
+def cyclical_pair(value, period):
+    """(sin, cos) of a value on a circle of the given period.
+
+    Plain Python beside the Spark version so the wrap-around is testable without a
+    session; both use the same formula. No production path calls this - it is the
+    oracle the local-Spark test in test_feature_engineering.py compares
+    standardize()'s channels 10-15 against, which is what actually exercises the
+    Spark expression below instead of this twin.
+    """
+    angle = 2.0 * math.pi * float(value) / period
+    return math.sin(angle), math.cos(angle)
 
 # How far the global mean/std may move before the whole table has to be rebuilt.
 # Expressed as a fraction of the feature's own standard deviation, so a near-zero
@@ -35,6 +82,12 @@ def create_spark_session() -> SparkSession:
     return (
         SparkSession.builder
         .appName("WeatherML_Feature_Engineering")
+        # F.hour/F.dayofyear (the calendar channels below) resolve through this
+        # setting, not a fixed calendar - they are the only values in the vector
+        # whose *content*, not just its formatting, depends on container locale.
+        # Pinned so they stay correct if an image ever sets TZ to something other
+        # than UTC; today they are UTC only because nothing happens to set it.
+        .config("spark.sql.session.timeZone", "UTC")
         .config("spark.sql.extensions",
                 "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions,"
                 "org.projectnessie.spark.extensions.NessieSparkSessionExtensions")
@@ -85,7 +138,9 @@ def load_published_stats(spark: SparkSession):
         for r in spark.table(SCALING_TABLE).collect()
     }
     try:
-        return {col: by_name[name] for col, name in zip(FEATURE_COLS, SERVING_FEATURE_NAMES)}
+        return {
+            column: by_name[name] for column, name in SCALED_COLUMNS
+        }
     except KeyError:
         return None
 
@@ -110,18 +165,43 @@ def stats_drifted(published: dict, current: dict, tolerance: float) -> bool:
 
 
 def standardize(df: DataFrame, stats: dict) -> DataFrame:
-    """Imputes nulls with the feature mean and standardizes, all in one projection.
+    """Imputes nulls with the feature mean, standardizes, and appends the cyclical
+    channels, all in one projection.
 
-    This replaces Imputer + VectorAssembler + StandardScaler. Applying the constants
-    directly is what makes an incremental run possible: new rows can be normalized
-    with exactly the parameters the existing rows already use.
+    Applying the constants directly is what makes an incremental run possible: new
+    rows can be normalized with exactly the parameters the existing rows already use.
     """
     columns = []
     for c in FEATURE_COLS:
         mean, std = stats[c]
         filled = F.coalesce(F.col(c), F.lit(mean))
         columns.append(((filled - F.lit(mean)) / F.lit(std)).cast("float"))
+
+    for _, period, value_fn in CYCLICAL_CHANNELS:
+        angle = (2.0 * math.pi / period) * value_fn()
+        columns.append(F.sin(angle).cast("float"))
+        columns.append(F.cos(angle).cast("float"))
+
     return df.select(F.col("timestamp"), F.array(*columns).alias("features"))
+
+
+def scaling_parameter_rows(stats: dict) -> list:
+    """One (feature_name, feature_index, mean, std) row per published channel.
+
+    Pulled out of write_scaling_parameters so the row layout - the thing an index
+    slip would corrupt while every row count and column name still looked right -
+    can be asserted on without a Spark session. Standardized columns first, in
+    SCALED_COLUMNS order, then the cyclical tail with identity scaling.
+    """
+    rows = [
+        (name, index, stats[column][0], stats[column][1])
+        for index, (column, name) in enumerate(SCALED_COLUMNS)
+    ]
+    rows += [
+        (name, len(SCALED_COLUMNS) + offset, 0.0, 1.0)
+        for offset, name in enumerate(SERVING_FEATURE_NAMES[len(SCALED_COLUMNS):])
+    ]
+    return rows
 
 
 def write_scaling_parameters(spark: SparkSession, stats: dict) -> None:
@@ -130,11 +210,12 @@ def write_scaling_parameters(spark: SparkSession, stats: dict) -> None:
     Only ever called on a full rebuild: on an incremental run the existing rows were
     normalized with the published values, so replacing them would silently make the
     stored vectors and the de-normalization disagree.
+
+    The cyclical channels are published too, with identity scaling. They need no
+    inverse transform, but a consumer reading this table must not have to know which
+    channels it silently omits.
     """
-    rows = [
-        (SERVING_FEATURE_NAMES[i], i, stats[c][0], stats[c][1])
-        for i, c in enumerate(FEATURE_COLS)
-    ]
+    rows = scaling_parameter_rows(stats)
     for name, _, mean_val, std_val in rows:
         logger.info(f"Scaling parameter -> {name}: mean={mean_val:.4f}, std={std_val:.4f}")
 

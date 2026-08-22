@@ -151,3 +151,24 @@ def test_adapt_block_is_the_newest_windows_and_disjoint_from_the_rest():
     train, val, test, adapt = split_windows(REAL_TABLE_WINDOWS, SEQ, PRED)
     assert adapt == list(range(REAL_TABLE_WINDOWS - RECENT_WINDOWS, REAL_TABLE_WINDOWS))
     assert max(train) < min(val) and max(val) < min(test) and max(test) < min(adapt)
+
+
+import torch
+
+from lakehouse import OUTPUT_CHANNELS
+
+
+def test_the_target_carries_only_the_forecast_channels():
+    """x keeps every input channel; y keeps only what the model predicts. Returning
+    all 16 as the target would have the model fitting the calendar it was handed."""
+    dataset = IcebergTimeSeriesDataset.__new__(IcebergTimeSeriesDataset)
+    dataset.seq_len, dataset.pred_len = 3, 2
+    dataset.valid_starts = np.array([0], dtype=np.int64)
+    dataset.data = torch.arange(16 * 5, dtype=torch.float32).reshape(5, 16)
+
+    x, y = dataset[0]
+
+    assert x.shape == (3, 16)
+    assert y.shape == (2, OUTPUT_CHANNELS)
+    # y must be the first columns of the rows that follow x, not a reshaped slice
+    assert torch.equal(y, dataset.data[3:5, :OUTPUT_CHANNELS])

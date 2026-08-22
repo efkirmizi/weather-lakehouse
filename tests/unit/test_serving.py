@@ -57,8 +57,9 @@ def test_denormalize_falls_back_to_identity_for_unknown_features():
 
 def _forecast_rows(hours, model, created_at, value=0.5, version="1"):
     return [{"forecast_timestamp": h, "predicted_features": [value, 0.0, 0.0, 0.0],
-             "model_name": model, "model_version": version, "created_at": created_at}
-            for h in hours]
+             "model_name": model, "model_version": version, "created_at": created_at,
+             "horizon": i + 1}
+            for i, h in enumerate(hours)]
 
 
 def test_latest_forecast_keeps_every_model_not_just_the_newest_batch(monkeypatch, hours):
@@ -93,12 +94,12 @@ def test_residuals_dedup_keeps_the_newest_write_whatever_the_scan_order(monkeypa
     fresh = _forecast_rows(hours, "M", pd.Timestamp("2026-08-20 05:00", tz="UTC"), value=1.0)
     stale = _forecast_rows(hours, "M", pd.Timestamp("2026-08-20 01:00", tz="UTC"), value=99.0)
     preds = pd.DataFrame(fresh + stale)          # stale physically last
-    actuals = pd.DataFrame([{"timestamp": h, "features": [1.0, 0.0, 0.0, 0.0]} for h in hours])
+    actuals = pd.DataFrame([{"timestamp": h, "features": [1.0] + [0.0] * 15} for h in hours])
     _fake_tables(monkeypatch, forecast_predictions=preds, ml_features=actuals)
 
     metrics = api.get_residuals()
-    assert len(metrics) == 1
-    assert metrics[0]["mae"] == 0.0          # the fresh row predicted the actual exactly
+    assert len(metrics) == len(hours)
+    assert all(row["mae"] == 0.0 for row in metrics)          # the fresh row predicted the actual exactly, at every horizon
 
 
 def test_a_failed_scaling_refresh_backs_off_instead_of_retrying_every_request(monkeypatch):
@@ -142,3 +143,19 @@ def test_a_table_that_does_not_exist_yet_reads_as_empty_not_as_a_failure(monkeyp
 
     assert "status" in api.get_latest_forecast()
     assert "status" in api.get_residuals()
+
+
+def test_residuals_are_reported_per_horizon(monkeypatch, hours):
+    """Averaging across horizons hides that t+24 error is more than twice t+1.
+    One row per (model, version, horizon) is what makes the curve visible."""
+    preds = pd.DataFrame(
+        _forecast_rows(hours, "M", pd.Timestamp("2026-08-20 05:00", tz="UTC"), value=1.0)
+    )
+    actuals = pd.DataFrame([{"timestamp": h, "features": [1.0] + [0.0] * 15} for h in hours])
+    _fake_tables(monkeypatch, forecast_predictions=preds, ml_features=actuals)
+
+    metrics = api.get_residuals()
+
+    assert len(metrics) == len(hours)
+    assert sorted(row["horizon"] for row in metrics) == list(range(1, len(hours) + 1))
+    assert all(row["samples"] == 1 for row in metrics)

@@ -91,4 +91,6 @@ jobs:
             tests/unit/test_drift_monitor.py \
             tests/unit/test_baselines.py \
             tests/unit/test_promotion.py \
-            tests/unit/test_evaluation.py -q
+            tests/unit/test_evaluation.py \
+            tests/unit/test_contract.py \
+            tests/unit/test_batch_inference.py -q

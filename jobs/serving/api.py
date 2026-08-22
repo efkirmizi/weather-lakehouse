@@ -219,16 +219,17 @@ def get_residuals():
         merged['abs_error'] = (merged['actual_target'] - merged['pred_target']).abs()
         merged['sq_error'] = (merged['actual_target'] - merged['pred_target']) ** 2
 
-        # Grouped by version as well as name: the same model_name can hold forecasts
-        # from an older champion, and averaging those together reports the error of a
-        # model that is no longer serving.
-        metrics = merged.groupby(['model_name', 'model_version']).agg(
+        # Grouped by horizon as well as by model and version: t+1 and t+24 are not the
+        # same forecasting problem, and averaging them together reports a number that
+        # describes neither. Measured on the test block, t+24 error is more than twice
+        # t+1's.
+        metrics = merged.groupby(['model_name', 'model_version', 'horizon']).agg(
             mae=('abs_error', 'mean'),
             rmse=('sq_error', lambda x: math.sqrt(x.mean())),
             samples=('abs_error', 'size'),
         ).reset_index()
 
-        return metrics.to_dict(orient='records')
+        return metrics.sort_values(['model_name', 'model_version', 'horizon']).to_dict(orient='records')
     except NoSuchTableError:
         # See get_latest_forecast: before the first forecast is written there is no
         # table to read, which is the same answer as having no rows in it.

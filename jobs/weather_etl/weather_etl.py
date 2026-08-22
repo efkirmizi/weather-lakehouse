@@ -30,10 +30,34 @@ TABLE_NAME = "nessie.weather.observations"
 # because scaling happens after imputation.
 EARLIEST_DATA_DATE = "1940-01-01"
 
+# One ordered declaration of what we pull, what we call it, and what counts as
+# physically possible. The Open-Meteo SDK hands variables back positionally -
+# hourly.Variables(i), in request order - so the request list and the column list
+# have to be generated from the same source. Hand-indexing four was survivable;
+# hand-indexing eleven means a reordering silently swaps two columns and every
+# downstream number stays plausible.
+HOURLY_VARIABLES = [
+    # (Open-Meteo name,          our column,                (low, high))
+    ("temperature_2m",            "temperature_c",           (-60.0, 60.0)),
+    ("relative_humidity_2m",      "humidity_percent",        (0.0, 100.0)),
+    ("precipitation",             "precipitation_mm",        (0.0, 500.0)),
+    ("wind_speed_10m",            "wind_speed_kmh",          (0.0, 300.0)),
+    ("pressure_msl",              "pressure_msl_hpa",        (870.0, 1085.0)),
+    ("dew_point_2m",              "dew_point_c",             (-60.0, 60.0)),
+    ("cloud_cover",               "cloud_cover_percent",     (0.0, 100.0)),
+    ("shortwave_radiation",       "shortwave_radiation_wm2", (0.0, 1400.0)),
+    ("soil_temperature_0_to_7cm", "soil_temperature_c",      (-60.0, 70.0)),
+    ("soil_moisture_0_to_7cm",    "soil_moisture_m3m3",      (0.0, 1.0)),
+    ("wind_direction_10m",        "wind_direction_deg",      (0.0, 360.0)),
+]
+
+# ERA5 puts the dew point a hair above the temperature at saturation.
+DEW_POINT_TOLERANCE_C = 0.5
+
 DEFAULT_PARAMS = {
     "latitude": 40.98,
     "longitude": 27.51,
-    "hourly": ["temperature_2m", "relative_humidity_2m", "precipitation", "wind_speed_10m"]
+    "hourly": [api_name for api_name, _, _ in HOURLY_VARIABLES],
 }
 
 def create_spark_session() -> SparkSession:
@@ -143,14 +167,16 @@ def transform_weather_data(response: Any) -> pd.DataFrame:
             freq=pd.Timedelta(seconds=hourly.Interval()),
             inclusive="left"
         ),
-        "temperature_c": hourly.Variables(0).ValuesAsNumpy(),
-        "humidity_percent": hourly.Variables(1).ValuesAsNumpy(),
-        "precipitation_mm": hourly.Variables(2).ValuesAsNumpy(),
-        "wind_speed_kmh": hourly.Variables(3).ValuesAsNumpy()
     }
-    
+    # Positional, in the order they were requested - which is why both come from
+    # HOURLY_VARIABLES rather than being written out twice.
+    for index, (_, column, _) in enumerate(HOURLY_VARIABLES):
+        hourly_data[column] = hourly.Variables(index).ValuesAsNumpy()
+
     df = pd.DataFrame(data=hourly_data)
-    # Drop any null rows just in case the API returned gaps for very old dates
+    # Drop any null rows just in case the API returned gaps for very old dates.
+    # The first 7 hours of 1940-01-01 are the known case: precipitation and
+    # shortwave_radiation need a preceding accumulation interval.
     df.dropna(inplace=True)
     return df
 
@@ -178,16 +204,25 @@ def run_data_quality_checks(df: pd.DataFrame) -> None:
     if df.isnull().values.any():
         raise ValueError("Data Quality Failure: DataFrame contains NULL values.")
         
-    # 2. Physical Range Bounds (e.g., Temperature between -60C and 60C)
-    if not df['temperature_c'].between(-60, 60).all():
-        raise ValueError("Data Quality Failure: Temperature out of physical bounds.")
-        
-    if not df['humidity_percent'].between(0, 100).all():
-        raise ValueError("Data Quality Failure: Humidity out of bounds (0% to 100%).")
-        
-    if not df['wind_speed_kmh'].between(0, 300).all(): # Max realistic wind speed
-        raise ValueError("Data Quality Failure: Wind speed exceeds realistic bounds.")
-        
+    # 2. Physical Range Bounds, from the same table that defines the columns.
+    for _, column, (low, high) in HOURLY_VARIABLES:
+        if not df[column].between(low, high).all():
+            raise ValueError(
+                f"Data Quality Failure: {column} outside its physical range "
+                f"[{low}, {high}]."
+            )
+
+    # 2b. A cross-column invariant, which is the only kind that catches a column
+    # mix-up: both values stay individually plausible when two columns are swapped.
+    # Air cannot hold more moisture than saturation, so the dew point can never
+    # exceed the temperature.
+    excess = df["dew_point_c"] - df["temperature_c"]
+    if (excess > DEW_POINT_TOLERANCE_C).any():
+        raise ValueError(
+            f"Data Quality Failure: dew point exceeds temperature by up to "
+            f"{excess.max():.2f} C. The columns are probably misaligned."
+        )
+
     # 3. Sequential Continuity Check
     #
     # A warning rather than a failure on purpose: the Open-Meteo archive genuinely

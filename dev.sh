@@ -56,7 +56,8 @@ test_unit() {
     run_pytest dag-pytorch-model-training:1.0 /app \
         /tests/unit/test_data_loader.py /tests/unit/test_trainer.py \
         /tests/unit/test_drift_monitor.py /tests/unit/test_baselines.py \
-        /tests/unit/test_promotion.py /tests/unit/test_evaluation.py
+        /tests/unit/test_promotion.py /tests/unit/test_evaluation.py \
+        /tests/unit/test_contract.py /tests/unit/test_batch_inference.py
     echo ">> unit tests: weather ETL image"
     run_pytest dag-pyspark-etl:1.0 /opt/spark/work-dir \
         /tests/unit/test_weather_etl.py

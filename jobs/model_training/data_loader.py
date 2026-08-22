@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader, Subset
 
-from lakehouse import load_iceberg_catalog, scan_ordered
+from lakehouse import OUTPUT_CHANNELS, load_iceberg_catalog, scan_ordered
 
 logger = logging.getLogger("ML_Training")
 
@@ -97,7 +97,10 @@ class IcebergTimeSeriesDataset(Dataset):
         target_end = end_idx + self.pred_len
 
         x = self.data[start_idx:end_idx]
-        y = self.data[end_idx:target_end]
+        # Only the weather channels are forecast. The calendar channels are
+        # deterministic and the exogenous ones are inputs; asking the model to
+        # reproduce them spends capacity on a task with no value.
+        y = self.data[end_idx:target_end, :OUTPUT_CHANNELS]
         return x, y
 
 

@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.optim as optim
 
 from data_loader import DEFAULT_MAX_FEATURE_AGE_HOURS, get_dataloaders
+from lakehouse import INPUT_CHANNELS, OUTPUT_CHANNELS, PRED_LEN, SEQ_LEN
 from models import TimeSeriesTransformer
 from trainer import get_champion_weights, resolve_epochs, train_and_register_model
 
@@ -20,8 +21,9 @@ torch.backends.cudnn.benchmark = True
 CONFIG = {
     "model_registry_name": "Weather_Forecaster_Transformer",
     "table_name": "weather.ml_features",
-    "seq_len": 72, "pred_len": 24, "batch_size": 128,
-    "feature_dim": 4, "d_model": 32, "n_heads": 2,
+    "seq_len": SEQ_LEN, "pred_len": PRED_LEN, "batch_size": 128,
+    "input_dim": INPUT_CHANNELS, "output_dim": OUTPUT_CHANNELS,
+    "d_model": 32, "n_heads": 2,
     "num_layers": 4, "dim_feedforward": 128, "dropout": 0.1,
     "patience": 4, "weight_decay": 1e-4
 }
@@ -52,8 +54,9 @@ def main():
     )
 
     model = TimeSeriesTransformer(
-        CONFIG["feature_dim"], CONFIG["d_model"], CONFIG["n_heads"], CONFIG["num_layers"], 
-        CONFIG["dim_feedforward"], CONFIG["feature_dim"], CONFIG["pred_len"], CONFIG["dropout"]
+        CONFIG["input_dim"], CONFIG["d_model"], CONFIG["n_heads"], CONFIG["num_layers"],
+        CONFIG["dim_feedforward"], CONFIG["output_dim"], CONFIG["pred_len"],
+        CONFIG["dropout"]
     ).to(device)
 
     if prev_weights:

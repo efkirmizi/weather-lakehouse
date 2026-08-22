@@ -2,6 +2,7 @@
 import datetime
 
 import pandas as pd
+import pytest
 
 import drift_monitor
 
@@ -62,3 +63,54 @@ def test_a_stale_table_falls_back_to_an_unbounded_scan():
 
 def test_an_empty_table_has_no_anchor():
     assert drift_monitor.latest_timestamp(FakeTable([])) is None
+
+
+class _FakeArrow:
+    """Enough of pyarrow's Table surface for both shapes main() reads through it:
+    a single selected column (latest_timestamp's probe) and a full frame (the
+    climatology scan)."""
+
+    def __init__(self, df):
+        self._df = df
+        self.num_rows = len(df)
+
+    def column(self, name):
+        series = self._df[name]
+        return type("Col", (), {"to_pandas": lambda _self: series})()
+
+    def to_pandas(self):
+        return self._df.copy()
+
+
+class _RecordingTable:
+    """Records selected_fields per scan() call, backed by one canned frame
+    regardless of row_filter - these tests only assert on the call shape."""
+
+    def __init__(self, df):
+        self._df = df
+        self.selected_fields = []
+
+    def scan(self, row_filter=None, selected_fields=None):
+        self.selected_fields.append(selected_fields)
+        return type("S", (), {"to_arrow": lambda _self: _FakeArrow(self._df)})()
+
+
+class _FakeCatalog:
+    def __init__(self, table):
+        self._table = table
+
+    def load_table(self, _name):
+        return self._table
+
+
+def test_the_climatology_scan_is_field_limited(monkeypatch):
+    """ml_features rows just grew from 4 to 16 floats; selecting every column when
+    main() reads two would quadruple the waste the anchor probe already avoids."""
+    df = pd.DataFrame({"timestamp": _hours(40), "features": [[20.0] * 16] * 40})
+    table = _RecordingTable(df)
+    monkeypatch.setattr(drift_monitor, "load_iceberg_catalog", lambda: _FakeCatalog(table))
+
+    with pytest.raises(SystemExit):
+        drift_monitor.main()
+
+    assert ("timestamp", "features") in table.selected_fields

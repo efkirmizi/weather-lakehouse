@@ -8,7 +8,7 @@ import onnxruntime as ort
 
 from pyiceberg.expressions import And, GreaterThanOrEqual, LessThanOrEqual
 from pyiceberg.schema import Schema
-from pyiceberg.types import TimestamptzType, ListType, FloatType, StringType, NestedField
+from pyiceberg.types import TimestamptzType, ListType, FloatType, StringType, NestedField, IntegerType
 from pyiceberg.partitioning import PartitionSpec, PartitionField
 from pyiceberg.transforms import DayTransform
 
@@ -16,15 +16,15 @@ import mlflow.onnx
 from mlflow.exceptions import MlflowException
 from mlflow.tracking import MlflowClient
 
-from lakehouse import load_iceberg_catalog, scan_ordered, ONNX_ARTIFACT_NAME
+from lakehouse import (
+    load_iceberg_catalog, scan_ordered, ONNX_ARTIFACT_NAME, SEQ_LEN, PRED_LEN,
+)
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("Dynamic_Batch_Inference")
 
 # Configuration
 MODEL_PREFIX = os.getenv("MODEL_PREFIX", "Weather_Forecaster_")
-SEQ_LEN = 72
-PRED_LEN = 24
 
 def discover_champions(client: MlflowClient, prefix: str):
     """Dynamically searches MLflow for any model with the given prefix holding a '@champion' alias."""
@@ -152,7 +152,10 @@ def open_predictions_table(catalog):
             NestedField(2, "predicted_features", ListType(element_id=3, element_type=FloatType()), required=True),
             NestedField(4, "model_name", StringType(), required=True),
             NestedField(5, "model_version", StringType(), required=True),
-            NestedField(6, "created_at", TimestamptzType(), required=True)
+            NestedField(6, "created_at", TimestamptzType(), required=True),
+            # 1-24. Known here and nowhere downstream, and without it every residual
+            # is an average over horizons whose difficulty differs by a factor of two.
+            NestedField(7, "horizon", IntegerType(), required=True),
         )
         spec = PartitionSpec(PartitionField(source_id=1, field_id=1000, transform=DayTransform(), name="forecast_day"))
         return catalog.create_table("weather.forecast_predictions", schema=schema, partition_spec=spec)
@@ -177,6 +180,18 @@ def already_forecast(predictions_table, future_timestamps):
 
     return set(zip(existing.column("model_name").to_pylist(),
                    existing.column("model_version").to_pylist()))
+
+
+def forecast_rows(model_name, version, future_timestamps, predictions, now_utc):
+    """One row per predicted hour, as column-name -> list."""
+    return {
+        "forecast_timestamp": list(future_timestamps),
+        "predicted_features": [list(row) for row in predictions],
+        "model_name": [model_name] * PRED_LEN,
+        "model_version": [str(version)] * PRED_LEN,
+        "created_at": [now_utc] * PRED_LEN,
+        "horizon": list(range(1, PRED_LEN + 1)),
+    }
 
 
 def main():
@@ -212,11 +227,10 @@ def main():
         return
 
     # 4. Run Inference Across the Remaining Champions
-    all_forecast_timestamps = []
-    all_predicted_features = []
-    all_model_names = []
-    all_model_versions = []
-    all_inference_times = []
+    columns = {
+        "forecast_timestamp": [], "predicted_features": [], "model_name": [],
+        "model_version": [], "created_at": [], "horizon": [],
+    }
 
     now_utc = datetime.datetime.now(datetime.timezone.utc)
 
@@ -226,14 +240,10 @@ def main():
             predict = load_predictor(client, model_name, version)
             predictions = predict(x_input)
 
-            # Extract the raw 24-hour sequence (predictions shape: [1, 24, 4])
-            pred_list = predictions[0].tolist()
-
-            all_forecast_timestamps.extend(future_timestamps)
-            all_predicted_features.extend(pred_list)
-            all_model_names.extend([model_name] * PRED_LEN)
-            all_model_versions.extend([str(version)] * PRED_LEN)
-            all_inference_times.extend([now_utc] * PRED_LEN)
+            for key, values in forecast_rows(
+                model_name, version, future_timestamps, predictions[0].tolist(), now_utc
+            ).items():
+                columns[key].extend(values)
 
             logger.info(f"Successfully generated predictions for '{model_name}'.")
 
@@ -241,7 +251,7 @@ def main():
             logger.error(f"Failed to generate predictions for '{model_name}': {e}", exc_info=True)
             continue
 
-    if not all_model_names:
+    if not columns["model_name"]:
         logger.error("All models failed during inference. Nothing to write.")
         sys.exit(1)
 
@@ -250,16 +260,18 @@ def main():
         pa.field("predicted_features", pa.list_(pa.field("element", pa.float32(), nullable=False)), nullable=False),
         pa.field("model_name", pa.string(), nullable=False),
         pa.field("model_version", pa.string(), nullable=False),
-        pa.field("created_at", pa.timestamp('us', tz='UTC'), nullable=False)
+        pa.field("created_at", pa.timestamp('us', tz='UTC'), nullable=False),
+        pa.field("horizon", pa.int32(), nullable=False),
     ])
 
     pa_table = pa.Table.from_arrays(
         [
-            pa.array(all_forecast_timestamps, type=pa.timestamp('us', tz='UTC')),
-            pa.array(all_predicted_features, type=pa.list_(pa.float32())),
-            pa.array(all_model_names, type=pa.string()),
-            pa.array(all_model_versions, type=pa.string()),
-            pa.array(all_inference_times, type=pa.timestamp('us', tz='UTC'))
+            pa.array(columns["forecast_timestamp"], type=pa.timestamp('us', tz='UTC')),
+            pa.array(columns["predicted_features"], type=pa.list_(pa.float32())),
+            pa.array(columns["model_name"], type=pa.string()),
+            pa.array(columns["model_version"], type=pa.string()),
+            pa.array(columns["created_at"], type=pa.timestamp('us', tz='UTC')),
+            pa.array(columns["horizon"], type=pa.int32()),
         ],
         schema=pa_schema
     )
@@ -267,7 +279,7 @@ def main():
     logger.info("Writing batch forecasts to Iceberg table 'weather.forecast_predictions'...")
     predictions_table.append(pa_table)
     logger.info(
-        f"Batch inference complete. Inserted {len(all_model_names)} forecast records "
+        f"Batch inference complete. Inserted {len(columns['model_name'])} forecast records "
         f"for {len(pending)} model(s); {len(champions) - len(pending)} were already current."
     )
 

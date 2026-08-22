@@ -127,16 +127,24 @@ Nessie branch `main`, namespace `weather`:
 | `scaling_parameters` | `02` | overwrite, on rebuild only |
 | `forecast_predictions` | `04` | append, partitioned by forecast day |
 
-`ml_features.features` is a `list<float32>` of four standardized values in the order
-`temperature, humidity, precipitation, wind_speed`. `scaling_parameters` holds the
-exact `StandardScaler` mean/std used to produce them, which is how the serving API
-converts predictions back into degrees Celsius.
+`ml_features.features` is a `list<float32>` of sixteen values: ten standardized
+weather variables, then three sin/cos pairs for wind direction, hour of day and day of
+year. The first four are `temperature, humidity, precipitation, wind_speed`, in that
+order and at those positions permanently — the serving API de-normalizes channel 0 as
+temperature from an image that cannot import the layout at all, and `drift_monitor`
+and `evaluate_and_promote` read it through `TEMPERATURE_CHANNEL`, which still only
+agrees with the writer by convention.
+`scaling_parameters` describes all sixteen; the six cyclical channels are published
+with identity scaling because they are already bounded in [-1, 1] and are never
+standardized.
+
+Models take all sixteen channels in and forecast the first four.
 
 ## Feature normalization
 
-`02` standardizes each feature with a single global mean and standard deviation, and
-publishes them to `weather.scaling_parameters` so the serving API can invert the
-transform back into degrees Celsius.
+`02` standardizes each of the ten weather-variable channels with a single global mean
+and standard deviation, and publishes them to `weather.scaling_parameters` so the
+serving API can invert the transform back into degrees Celsius.
 
 Because every row in `ml_features` has to share one normalization, the job does not
 recompute the parameters on every run. It compares the current global statistics
@@ -358,6 +366,11 @@ split and warm-start bugs lives, so it is the one that must not be dropped.
   container — `02` is dataset-triggered on every `01` and its container is
   auto-removed, so the cache was cold every time — and made Maven Central a hard
   runtime dependency. Bump the versions in the Dockerfiles.
+- **Error is reported per horizon.** t+1 and t+24 are not the same problem: measured
+  on the test block, the champions beat seasonal-naive by 65% at t+1 and by 9% at
+  t+24. `evaluate_and_promote` logs the curve for both models and both baselines, and
+  `/api/v1/metrics/residuals` returns one row per `(model, version, horizon)`. A
+  single averaged number describes neither end of the horizon.
 
 ## Timestamps
 

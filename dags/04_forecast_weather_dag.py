@@ -57,7 +57,7 @@ with DAG(
         },
         command="python batch_inference.py",
         docker_url="unix://var/run/docker.sock",
-        # No GPU request and no single_gpu slot: inference is one 72x4 forward pass
+        # No GPU request and no single_gpu slot: inference is one 72x16 forward pass
         # per champion through the CPU ONNX Runtime. Holding a GPU slot here would
         # only block training.
         retries=1,

@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.optim as optim
 
 from data_loader import DEFAULT_MAX_FEATURE_AGE_HOURS, get_dataloaders
+from lakehouse import INPUT_CHANNELS, OUTPUT_CHANNELS, PRED_LEN, SEQ_LEN
 from models import ConvLSTMWeatherForecaster
 from trainer import get_champion_weights, resolve_epochs, train_and_register_model
 
@@ -20,8 +21,9 @@ torch.backends.cudnn.benchmark = True
 CONFIG = {
     "model_registry_name": "Weather_Forecaster_FastLSTM",
     "table_name": "weather.ml_features",
-    "seq_len": 72, "pred_len": 24, "batch_size": 128,
-    "feature_dim": 4, "hidden_dim": 64, "dropout": 0.2,
+    "seq_len": SEQ_LEN, "pred_len": PRED_LEN, "batch_size": 128,
+    "input_dim": INPUT_CHANNELS, "output_dim": OUTPUT_CHANNELS,
+    "hidden_dim": 64, "dropout": 0.2,
     "patience": 4, "weight_decay": 1e-4
 }
 
@@ -48,7 +50,7 @@ def main():
     )
 
     model = ConvLSTMWeatherForecaster(
-        CONFIG["feature_dim"], CONFIG["hidden_dim"], CONFIG["feature_dim"], 
+        CONFIG["input_dim"], CONFIG["hidden_dim"], CONFIG["output_dim"],
         CONFIG["pred_len"], CONFIG["dropout"]
     ).to(device)
 

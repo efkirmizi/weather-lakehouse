@@ -15,6 +15,21 @@ S3_ENDPOINT = "http://minio:9000"
 ONNX_ARTIFACT_NAME = "onnx_model"
 ONNX_OPSET = 17
 
+# The window and channel geometry every job in this image has to agree on. These were
+# literals in three separate files; a mismatch does not raise anything, it just slices
+# a different window and reports a confident wrong number.
+SEQ_LEN = 72
+PRED_LEN = 24
+
+# ml_features carries 16 channels (see 02's channel declaration and the published
+# scaling_parameters); only the first four - temperature, humidity, precipitation,
+# wind_speed - are forecast. The rest are exogenous or deterministic inputs.
+INPUT_CHANNELS = 16
+OUTPUT_CHANNELS = 4
+# Position of temperature, which is what the serving layer de-normalizes and what the
+# per-horizon benchmark reports.
+TEMPERATURE_CHANNEL = 0
+
 
 def load_iceberg_catalog():
     return load_catalog(
@@ -39,3 +54,22 @@ def scan_ordered(table, fields):
     """
     arrow_table = table.scan(selected_fields=fields).to_arrow()
     return arrow_table.sort_by([("timestamp", "ascending")])
+
+
+def load_scaling_parameters(catalog):
+    """{feature_name: (mean, std)} exactly as 02 published them.
+
+    The gate scores in normalized units, which are unreadable. This is the same table
+    the serving API inverts with, so a number reported here and a number on the
+    dashboard mean the same thing.
+    """
+    table = catalog.load_table(("weather", "scaling_parameters"))
+    arrow = table.scan().to_arrow()
+    return {
+        name: (float(mean), float(std))
+        for name, mean, std in zip(
+            arrow.column("feature_name").to_pylist(),
+            arrow.column("mean_value").to_pylist(),
+            arrow.column("std_value").to_pylist(),
+        )
+    }

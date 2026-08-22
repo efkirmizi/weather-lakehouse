@@ -10,7 +10,7 @@ from scipy.stats import ks_2samp
 
 from pyiceberg.expressions import And, GreaterThanOrEqual, LessThanOrEqual, Or
 
-from lakehouse import load_iceberg_catalog
+from lakehouse import load_iceberg_catalog, TEMPERATURE_CHANNEL
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("Drift_Monitor")
@@ -170,14 +170,18 @@ def main():
         logger.info("Feature table is empty. Skipping.")
         sys.exit(0)
 
-    df = table.scan(row_filter=climatology_filter(anchor)).to_arrow().to_pandas()
+    df = table.scan(
+        row_filter=climatology_filter(anchor),
+        selected_fields=("timestamp", "features"),
+    ).to_arrow().to_pandas()
     if df.empty:
         logger.info("No data in the seasonal window. Skipping.")
         sys.exit(0)
 
-    # Convert timestamps and extract the raw temperature feature (Index 0)
     df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
-    df['temperature'] = df['features'].apply(lambda x: x[0])
+    # Channel 0 is temperature by the layout 02 publishes to scaling_parameters, which
+    # is fixed and which nothing here can verify - this image and that one never meet.
+    df['temperature'] = df['features'].apply(lambda x: x[TEMPERATURE_CHANNEL])
     df = df.sort_values('timestamp')
 
     # 2. Target = last 24 hours. Baseline = the same time of year in earlier years.

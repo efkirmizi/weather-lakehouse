@@ -46,21 +46,19 @@ try:
 
     if "status" not in metrics_data:
         df_metrics = pd.DataFrame(metrics_data)
+        df_metrics["model"] = df_metrics["model_name"] + " v" + df_metrics["model_version"].astype(str)
         col1, col2 = st.columns(2)
-        
-        with col1:
-            fig_mae = px.bar(
-                df_metrics, x="model_name", y="mae", color="model_version",
-                barmode="group", title="Mean Absolute Error (MAE)", template="plotly_white"
-            )
-            st.plotly_chart(fig_mae, use_container_width=True)
-            
-        with col2:
-            fig_rmse = px.bar(
-                df_metrics, x="model_name", y="rmse", color="model_version",
-                barmode="group", title="Root Mean Square Error (RMSE)", template="plotly_white"
-            )
-            st.plotly_chart(fig_rmse, use_container_width=True)
+
+        for column, metric, title in ((col1, "mae", "Mean Absolute Error (MAE)"),
+                                      (col2, "rmse", "Root Mean Square Error (RMSE)")):
+            with column:
+                fig = px.line(
+                    df_metrics.sort_values("horizon"),
+                    x="horizon", y=metric, color="model", markers=True,
+                    labels={"horizon": "Forecast horizon (hours ahead)", metric: "°C"},
+                    title=f"{title} by horizon", template="plotly_white",
+                )
+                st.plotly_chart(fig, use_container_width=True)
     else:
         st.info("Waiting for actual weather data to overlap with predictions to calculate errors.")
 except Exception as e:
