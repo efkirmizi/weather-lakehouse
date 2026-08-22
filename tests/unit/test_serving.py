@@ -120,3 +120,25 @@ def test_a_failed_scaling_refresh_backs_off_instead_of_retrying_every_request(mo
     api.refresh_scaling_parameters()
 
     assert len(calls) == 1
+
+
+def test_a_table_that_does_not_exist_yet_reads_as_empty_not_as_a_failure(monkeypatch):
+    """On a cold start `weather.forecast_predictions` has not been created.
+
+    `04` creates it only after it finds a `@champion`, and on a fresh registry it
+    exits before that - so between the first feature run and the first training run
+    the table is simply absent. That is the normal early state, and it is what the
+    "no forecasts" branch already exists to report; letting NoSuchTableError reach the
+    blanket handler instead turns it into a 503 and puts an error banner on the
+    dashboard of a stack that is working exactly as designed.
+    """
+    from pyiceberg.exceptions import NoSuchTableError
+
+    def missing(name):
+        raise NoSuchTableError(f"Table does not exist: weather.{name}")
+
+    monkeypatch.setattr(api, "get_iceberg_table", missing)
+    monkeypatch.setattr(api, "refresh_scaling_parameters", lambda force=False: None)
+
+    assert "status" in api.get_latest_forecast()
+    assert "status" in api.get_residuals()

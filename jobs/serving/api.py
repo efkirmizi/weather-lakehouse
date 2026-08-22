@@ -9,6 +9,7 @@ from functools import lru_cache
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from pyiceberg.catalog import load_catalog
+from pyiceberg.exceptions import NoSuchTableError
 from pyiceberg.expressions import GreaterThanOrEqual, LessThanOrEqual, And
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -153,6 +154,12 @@ def get_latest_forecast():
         pivot_df['forecast_timestamp'] = pivot_df['forecast_timestamp'].astype(str)
 
         return pivot_df.to_dict(orient='records')
+    except NoSuchTableError:
+        # A cold start has no forecast table at all: `04` creates it only once it finds
+        # a @champion, and on an empty registry it exits before that. Absent and empty
+        # mean the same thing to a caller, and reporting 503 for the normal early state
+        # of a healthy stack only trains people to ignore the error.
+        return {"status": f"no forecasts in the last {FORECAST_LOOKBACK_DAYS} days"}
     except Exception:
         # Log the detail, return a generic message: the raw exception can carry bucket
         # names and endpoints, and a 200 would let clients read a failure as success.
@@ -222,6 +229,10 @@ def get_residuals():
         ).reset_index()
 
         return metrics.to_dict(orient='records')
+    except NoSuchTableError:
+        # See get_latest_forecast: before the first forecast is written there is no
+        # table to read, which is the same answer as having no rows in it.
+        return {"status": "insufficient data"}
     except Exception:
         logger.exception("metrics/residuals failed")
         raise HTTPException(status_code=503, detail="Could not compute residuals from the lakehouse.")
