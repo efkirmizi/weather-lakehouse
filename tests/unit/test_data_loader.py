@@ -1,6 +1,9 @@
 """Windowing and splitting logic. Runs inside dag-pytorch-model-training (PYTHONPATH=/app)."""
 import numpy as np
 import pytest
+import torch
+
+from lakehouse import OUTPUT_CHANNELS
 
 from data_loader import (
     REPLAY_PER_RECENT,
@@ -151,11 +154,6 @@ def test_adapt_block_is_the_newest_windows_and_disjoint_from_the_rest():
     train, val, test, adapt = split_windows(REAL_TABLE_WINDOWS, SEQ, PRED)
     assert adapt == list(range(REAL_TABLE_WINDOWS - RECENT_WINDOWS, REAL_TABLE_WINDOWS))
     assert max(train) < min(val) and max(val) < min(test) and max(test) < min(adapt)
-
-
-import torch
-
-from lakehouse import OUTPUT_CHANNELS
 
 
 def test_the_target_carries_only_the_forecast_channels():

@@ -1,5 +1,23 @@
 """Rebuild-vs-append decision. Runs inside dag-pyspark-feature-engineering."""
-from feature_engineering import FEATURE_COLS, stats_drifted
+import datetime
+import math
+from types import SimpleNamespace
+
+import pytest
+from pyspark.sql import SparkSession
+
+from feature_engineering import (
+    CYCLICAL_CHANNELS,
+    SCALING_TABLE,
+    FEATURE_COLS,
+    SCALED_COLUMNS,
+    SERVING_FEATURE_NAMES,
+    cyclical_pair,
+    load_published_stats,
+    scaling_parameter_rows,
+    standardize,
+    stats_drifted,
+)
 
 TOL = 0.01
 
@@ -43,18 +61,6 @@ def test_near_zero_mean_still_rebuilds_on_a_real_shift():
     published = _stats(**{precip: (0.05, 0.30)})
     current = _stats(**{precip: (0.10, 0.30)})    # 17% of a std
     assert stats_drifted(published, current, TOL) is True
-
-
-import math
-
-from feature_engineering import (
-    CYCLICAL_CHANNELS,
-    FEATURE_COLS,
-    SCALED_COLUMNS,
-    SERVING_FEATURE_NAMES,
-    cyclical_pair,
-    scaling_parameter_rows,
-)
 
 
 def test_the_first_four_channels_never_move():
@@ -153,12 +159,66 @@ def test_feature_index_is_contiguous_and_aligned_with_serving_names():
     assert [name for name, _, _, _ in rows] == SERVING_FEATURE_NAMES
 
 
-import datetime
+class _StubSpark:
+    """Enough SparkSession for load_published_stats, which only ever reaches for
+    catalog.tableExists() and table().collect().
 
-import pytest
-from pyspark.sql import SparkSession
+    The real table is the three-part Iceberg name nessie.weather.scaling_parameters,
+    which a bare local session cannot create - reading the actual table belongs to
+    the integration suite. What is worth pinning here is the mapping: the table is
+    keyed by *serving* name, every consumer is keyed by *column* name, and nothing
+    but SCALED_COLUMNS relates the two.
+    """
 
-from feature_engineering import standardize
+    def __init__(self, rows):
+        self._rows = rows
+        self.catalog = SimpleNamespace(
+            tableExists=lambda name: rows is not None and name == SCALING_TABLE
+        )
+
+    def table(self, name):
+        assert name == SCALING_TABLE
+        return SimpleNamespace(collect=lambda: self._rows)
+
+
+def _published(stats):
+    """The scaling table exactly as write_scaling_parameters leaves it."""
+    return [
+        {"feature_name": name, "feature_index": index,
+         "mean_value": mean, "std_value": std}
+        for name, index, mean, std in scaling_parameter_rows(stats)
+    ]
+
+
+def test_published_stats_survive_the_round_trip_through_the_scaling_table():
+    """The reader has to invert the writer: rows go out keyed by serving name and
+    must come back keyed by column name, with the six cyclical rows dropped rather
+    than passed through.
+
+    Verified by mutation: keying the result by name instead of column, or returning
+    every published row, both fail here. Note what this does *not* catch - swapping a
+    pair inside SCALED_COLUMNS cancels out, because both directions read the same
+    table, and the round trip stays green. test_the_first_four_channels_never_move is
+    the test that catches that one."""
+    stats = _stats_with_distinct_values()
+    recovered = load_published_stats(_StubSpark(_published(stats)))
+    assert recovered == {column: stats[column] for column, _ in SCALED_COLUMNS}
+
+
+def test_an_absent_scaling_table_reads_as_no_published_stats():
+    """First run of a fresh warehouse: nothing published yet, so there is nothing to
+    compare against and main() must take the full-rebuild path."""
+    assert load_published_stats(_StubSpark(None)) is None
+
+
+def test_a_table_missing_a_feature_reads_as_no_published_stats():
+    """A scaling table published when the vector was narrower has no row for the
+    features added since. Returning None routes main() into the rebuild that is
+    exactly the right response; a KeyError escaping here would instead fail the DAG
+    with no recovery but dropping the table by hand."""
+    short = [row for row in _published(_stats_with_distinct_values())
+             if row["feature_name"] != "soil_moisture"]
+    assert load_published_stats(_StubSpark(short)) is None
 
 
 @pytest.fixture(scope="module")

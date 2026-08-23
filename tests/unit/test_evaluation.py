@@ -5,7 +5,13 @@ import pytest
 import torch
 import torch.nn as nn
 
-from evaluate_and_promote import horizon_rmse_celsius, resolve_temperature_std, score_predictors
+from evaluate_and_promote import (
+    can_score,
+    champion_alone_cannot_score,
+    horizon_rmse_celsius,
+    resolve_temperature_std,
+    score_predictors,
+)
 from lakehouse import OUTPUT_CHANNELS
 
 PRED = 24
@@ -223,9 +229,6 @@ def test_resolve_temperature_std_falls_back_when_the_catalog_itself_is_unreachab
 
     assert std == 1.0
     assert unit == "normalized"
-
-
-from evaluate_and_promote import can_score, champion_alone_cannot_score
 
 
 def test_a_model_that_matches_the_current_vector_can_be_scored():

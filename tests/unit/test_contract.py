@@ -2,9 +2,14 @@
 
 Runs inside dag-pytorch-model-training (PYTHONPATH=/app).
 """
+import ast
+
+import torch
+
 import batch_inference
 import evaluate_and_promote
 import lakehouse
+from models import ConvLSTMWeatherForecaster, TimeSeriesTransformer
 
 
 def test_the_contract_declares_the_geometry():
@@ -28,11 +33,6 @@ def test_every_consumer_reads_the_same_window_geometry():
     assert batch_inference.PRED_LEN == lakehouse.PRED_LEN
     assert evaluate_and_promote.SEQ_LEN == lakehouse.SEQ_LEN
     assert evaluate_and_promote.PRED_LEN == lakehouse.PRED_LEN
-
-
-import torch
-
-from models import ConvLSTMWeatherForecaster, TimeSeriesTransformer
 
 
 def _batch():
@@ -66,9 +66,6 @@ def test_the_training_configs_agree_with_the_contract():
         assert config["output_dim"] == lakehouse.OUTPUT_CHANNELS
         assert config["seq_len"] == lakehouse.SEQ_LEN
         assert config["pred_len"] == lakehouse.PRED_LEN
-
-
-import ast
 
 
 def _config_keys_referenced_in_source(module):

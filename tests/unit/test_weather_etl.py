@@ -2,7 +2,14 @@
 import pandas as pd
 import pytest
 
-from weather_etl import EARLIEST_DATA_DATE, drop_already_ingested, generate_date_chunks
+from weather_etl import (
+    DEFAULT_PARAMS,
+    EARLIEST_DATA_DATE,
+    HOURLY_VARIABLES,
+    drop_already_ingested,
+    generate_date_chunks,
+    run_data_quality_checks,
+)
 
 
 def _day(date_str, hours=24, start_hour=0):
@@ -53,16 +60,6 @@ def test_a_mid_day_watermark_refetches_its_own_day():
     watermark = pd.Timestamp("2026-08-18 18:00", tz="UTC")
     chunks = generate_date_chunks(watermark)
     assert chunks and chunks[0][0] == "2026-08-18"
-
-
-import pandas as pd
-import pytest
-
-from weather_etl import (
-    DEFAULT_PARAMS,
-    HOURLY_VARIABLES,
-    run_data_quality_checks,
-)
 
 
 def _valid_frame(**overrides):
