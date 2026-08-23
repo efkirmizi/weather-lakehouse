@@ -14,7 +14,7 @@ import pytest
 import requests
 
 from lakehouse import (INPUT_CHANNELS, MLFLOW_TRACKING_URI, ONNX_ARTIFACT_NAME,
-                       PRED_LEN, S3_ENDPOINT, SEQ_LEN)
+                       PRED_LEN, S3_ENDPOINT, SEQ_LEN, scan_ordered)
 
 API = "http://lakehouse-serving:8000"
 REGISTERED_MODELS = ["Weather_Forecaster_FastLSTM", "Weather_Forecaster_Transformer"]
@@ -85,15 +85,31 @@ def test_the_api_serves_a_full_horizon_from_every_champion():
         assert all(model_name in row for row in payload), f"{model_name} missing from the forecast"
 
 
-def test_the_served_temperatures_are_in_degrees_not_in_normalized_units():
-    """The one failure this whole scaling_parameters contract exists to prevent, seen
-    from the outside: if the API's inverse transform is skipped or reads the wrong
-    row, the numbers stay plausible-looking floats near zero instead of raising."""
-    payload = requests.get(f"{API}/api/v1/forecast/latest", timeout=60).json()
+def test_the_served_forecast_continues_the_observed_series(catalog):
+    """The next 24 hours have to look like weather that follows the last observed
+    hour, not like numbers from somewhere else.
 
-    values = [row[m] for row in payload for m in REGISTERED_MODELS if m in row]
-    assert values, "no forecast values to check"
-    assert any(abs(v) > 5.0 for v in values), (
-        f"every forecast sits within +/-5 of zero ({min(values):.2f} to {max(values):.2f}), "
-        "which is what normalized units look like when de-normalization is skipped"
+    An earlier version of this test asserted only that some served value sat outside
+    +/-5, on the reasoning that normalized units cluster near zero. That passes every
+    August in this location and would raise a false alarm some January, when the real
+    temperature is near zero too - a test whose verdict depends on the season is not
+    a test. Anchoring to the last observation instead is what makes it year-round.
+
+    A 20 degree band is far wider than a real 24-hour swing here and still far
+    narrower than the gap between a z-score and a temperature whenever the ambient
+    value is not close to the training mean. It also catches a model that has simply
+    come apart, whatever the cause.
+    """
+    observations = catalog.load_table(("weather", "observations"))
+    column = scan_ordered(observations, ("timestamp", "temperature_c")).column("temperature_c")
+    last_observed = column.to_pylist()[-1]
+
+    payload = requests.get(f"{API}/api/v1/forecast/latest", timeout=60).json()
+    served = [row[m] for row in payload for m in REGISTERED_MODELS if m in row]
+
+    assert served, "no forecast values to check"
+    stray = [v for v in served if abs(v - last_observed) >= 20.0]
+    assert not stray, (
+        f"last observed {last_observed:.1f} degC, but the forecast contains "
+        f"{stray[:5]} - either de-normalization was skipped or the model is broken"
     )
