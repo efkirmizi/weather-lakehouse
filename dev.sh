@@ -69,12 +69,32 @@ test_unit() {
         /tests/unit/test_serving.py
 }
 
+test_integration() {
+    echo ">> integration tests against the running stack"
+    if [ ! -f "${ROOT}/.env" ]; then
+        echo "no .env - this suite talks to the live stack, see PROJECT_CONTEXT section 6" >&2
+        exit 1
+    fi
+    # The job containers receive these from an Airflow connection, rendered per task
+    # run. A bare docker run has to read them from the same .env Compose reads, with
+    # the same app-user-then-admin fallback the serving service uses.
+    set -a; . "${ROOT}/.env"; set +a
+    docker run --rm --user root --network lakehouse-net \
+        -v "${ROOT}/tests":/tests \
+        -e PYTHONPATH=/app \
+        -e AWS_ACCESS_KEY_ID="${MINIO_APP_USER:-${MINIO_ADMIN_USER}}" \
+        -e AWS_SECRET_ACCESS_KEY="${MINIO_APP_PASSWORD:-${MINIO_ADMIN_PASSWORD}}" \
+        dag-pytorch-model-training:1.0 \
+        sh -c "pip install -q pytest && python -m pytest /tests/integration -q -p no:cacheprovider"
+}
+
 case "${1:-help}" in
     build)        build_jobs; docker compose build ;;
     build-jobs)   build_jobs ;;
     up)           docker compose up -d ;;
     down)         docker compose down ;;
     test)         test_static; test_dags; test_unit ;;
+    test-integration) test_integration ;;
     test-static)  test_static ;;
     test-dags)    test_dags ;;
     test-unit)    test_unit ;;
@@ -89,6 +109,8 @@ usage: ./dev.sh <command>
   test-static  dependency-free checks (run these first, they are instant)
   test-dags    parse the DAG folder exactly as the scheduler does
   test-unit    unit tests, each inside the image holding its dependencies
+  test-integration
+               against the running stack - needs 'up' first, not part of 'test'
 USAGE
         ;;
 esac
