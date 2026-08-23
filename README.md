@@ -46,6 +46,7 @@ docker compose up -d --build
 ./dev.sh build     # job images + Compose services
 ./dev.sh up        # start the stack
 ./dev.sh test      # static checks + DAG parsing + unit tests
+./dev.sh test-integration   # against the running stack, so 'up' first
 ```
 
 `DOCKER_GID` comes from `getent group docker | cut -d: -f3`. The Airflow **scheduler**
@@ -392,5 +393,10 @@ both tables had to special-case them. Keep new tables `timestamptz`.
   local stack, not for a shared one.
 - **No auth on Nessie or MLflow**, and MLflow's backend store is SQLite. Both are
   fine for single-node development and neither is fine beyond it.
-- **No integration tests.** The suites cover pure logic and DAG structure; anything
-  touching Iceberg, MLflow or Spark is still verified by running the DAGs.
+- **The integration suite needs the stack up, so CI never runs it.** `tests/integration`
+  covers the boundaries the unit suites can only stub - Iceberg through Nessie onto
+  MinIO, the `scaling_parameters` layout three images agree on without being able to
+  import each other, the champion's ONNX graph and the served forecast. It needs
+  Nessie, MinIO, MLflow and the API running and the 11 GB training image to run in, so
+  it is `./dev.sh test-integration` after `./dev.sh up`, never a CI job. Spark is still
+  covered only by running the DAGs.
