@@ -98,3 +98,44 @@ def test_every_config_key_read_in_source_is_defined_in_the_dict():
     for module in (train_lstm, train_transformer):
         missing = _config_keys_referenced_in_source(module) - module.CONFIG.keys()
         assert not missing, f"{module.__name__} reads undefined CONFIG keys: {missing}"
+
+
+def _call_line_in_main(module, func_name):
+    """Line of the first call to func_name inside main(), found by parsing.
+
+    Same reason as _config_keys_referenced_in_source above: the calls that matter
+    are inside main(), which importing the module never runs."""
+    with open(module.__file__) as f:
+        tree = ast.parse(f.read())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "main":
+            for call in ast.walk(node):
+                if (isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+                        and call.func.id == func_name):
+                    return call.lineno
+    return None
+
+
+def test_the_warm_start_decision_precedes_everything_that_reads_it():
+    """warm_start() returns the *effective* incremental flag: False means the
+    champion's weights did not fit the architecture, so this run is a scratch run.
+
+    get_dataloaders and resolve_epochs branch on that same flag - the data window, the
+    epoch budget and the learning rate all come from it. Put either of them above the
+    warm_start call and a declined warm start still trains a randomly initialised
+    model for two epochs at 1e-4 on the recent-window split: not a scratch run, not an
+    incremental one, and nothing in the logs or the registry would look wrong. It
+    would simply be a bad model, promoted or rejected on its merits."""
+    import train_lstm
+    import train_transformer
+
+    for module in (train_lstm, train_transformer):
+        decision = _call_line_in_main(module, "warm_start")
+        assert decision is not None, f"{module.__name__}.main() never calls warm_start"
+
+        for dependent in ("get_dataloaders", "resolve_epochs"):
+            line = _call_line_in_main(module, dependent)
+            assert line is not None and line > decision, (
+                f"{module.__name__}.main(): {dependent} on line {line} reads the "
+                f"incremental flag before warm_start settles it on line {decision}"
+            )

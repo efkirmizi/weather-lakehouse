@@ -12,7 +12,7 @@ import torch.optim as optim
 from data_loader import DEFAULT_MAX_FEATURE_AGE_HOURS, get_dataloaders
 from lakehouse import INPUT_CHANNELS, OUTPUT_CHANNELS, PRED_LEN, SEQ_LEN
 from models import TimeSeriesTransformer
-from trainer import get_champion_weights, resolve_epochs, train_and_register_model
+from trainer import get_champion_weights, resolve_epochs, train_and_register_model, warm_start
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 torch.backends.cudnn.benchmark = True
@@ -34,11 +34,18 @@ def main():
     mode = os.getenv("TRAINING_MODE", "SCRATCH")
     is_incremental = (mode == "INCREMENTAL")
 
-    prev_weights = None
-    if is_incremental:
-        prev_weights = get_champion_weights(CONFIG["model_registry_name"], device)
-        if prev_weights is None:
-            is_incremental = False
+    prev_weights = get_champion_weights(CONFIG["model_registry_name"], device) if is_incremental else None
+
+    model = TimeSeriesTransformer(
+        CONFIG["input_dim"], CONFIG["d_model"], CONFIG["n_heads"], CONFIG["num_layers"],
+        CONFIG["dim_feedforward"], CONFIG["output_dim"], CONFIG["pred_len"],
+        CONFIG["dropout"]
+    ).to(device)
+
+    # The model is built before the loaders and the schedule because whether the
+    # champion's weights actually fit decides all three, and only a constructed model
+    # can answer that. Everything below reads the effective flag, never the request.
+    is_incremental = warm_start(model, prev_weights)
 
     epochs = resolve_epochs(is_incremental, scratch=10, incremental=2)
     lr = 1e-4 if is_incremental else 0.001
@@ -52,16 +59,6 @@ def main():
         CONFIG["table_name"], CONFIG["seq_len"], CONFIG["pred_len"], CONFIG["batch_size"],
         is_incremental, max_age_hours=DEFAULT_MAX_FEATURE_AGE_HOURS
     )
-
-    model = TimeSeriesTransformer(
-        CONFIG["input_dim"], CONFIG["d_model"], CONFIG["n_heads"], CONFIG["num_layers"],
-        CONFIG["dim_feedforward"], CONFIG["output_dim"], CONFIG["pred_len"],
-        CONFIG["dropout"]
-    ).to(device)
-
-    if prev_weights:
-        model.load_state_dict(prev_weights)
-        logger.info("Successfully warm-started model with previous weights.")
 
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=CONFIG["weight_decay"])
     if warmup_epochs > 0:
@@ -77,7 +74,7 @@ def main():
         # See train_lstm.py: the effective mode, not the requested one.
         "training_mode": "INCREMENTAL" if is_incremental else "SCRATCH",
         "requested_mode": mode,
-        "warm_started": prev_weights is not None,
+        "warm_started": is_incremental,
         "model_type": "Transformer", "epochs": epochs, "initial_lr": lr, "optimizer": "AdamW",
     }
 

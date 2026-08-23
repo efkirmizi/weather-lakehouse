@@ -4,6 +4,8 @@ import os
 from types import SimpleNamespace
 
 import pytest
+import torch
+import torch.nn as nn
 
 import trainer
 from trainer import resolve_epochs
@@ -103,3 +105,37 @@ def test_warm_start_talks_to_the_tracking_server_not_the_local_store(monkeypatch
 
     assert seen["uri_at_lookup"] == "http://mlflow:5000"
     assert seen["s3_at_lookup"] == "http://minio:9000"
+
+
+def _tiny(width):
+    """A stand-in for a real forecaster: all warm_start cares about is whether the
+    tensor shapes line up."""
+    return nn.Sequential(nn.Linear(width, 4))
+
+
+def test_warm_start_loads_weights_that_fit():
+    source = _tiny(8)
+    target = _tiny(8)
+
+    assert trainer.warm_start(target, source.state_dict()) is True
+    assert torch.equal(target[0].weight, source[0].weight)
+
+
+def test_warm_start_declines_weights_from_a_different_architecture():
+    """Change a hyperparameter - a wider d_model, another layer, a different input
+    width - and the champion's tensors no longer fit the model just built.
+    load_state_dict raises, and the weekly INCREMENTAL run dies as a DAG failure
+    instead of doing the obviously right thing: the architecture changed, so there is
+    nothing to resume from, so train from scratch. get_champion_weights already
+    applies that fallback when the champion cannot be fetched at all; this is the
+    same fallback one step later."""
+    champion = _tiny(8).state_dict()
+    model = _tiny(16)
+    untouched = model[0].weight.clone()
+
+    assert trainer.warm_start(model, champion) is False
+    assert torch.equal(model[0].weight, untouched), "a declined warm start must leave the fresh init alone"
+
+
+def test_warm_start_declines_when_there_is_no_champion():
+    assert trainer.warm_start(_tiny(8), None) is False

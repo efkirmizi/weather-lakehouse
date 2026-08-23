@@ -12,7 +12,7 @@ import torch.optim as optim
 from data_loader import DEFAULT_MAX_FEATURE_AGE_HOURS, get_dataloaders
 from lakehouse import INPUT_CHANNELS, OUTPUT_CHANNELS, PRED_LEN, SEQ_LEN
 from models import ConvLSTMWeatherForecaster
-from trainer import get_champion_weights, resolve_epochs, train_and_register_model
+from trainer import get_champion_weights, resolve_epochs, train_and_register_model, warm_start
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 torch.backends.cudnn.benchmark = True
@@ -33,11 +33,17 @@ def main():
     mode = os.getenv("TRAINING_MODE", "SCRATCH")
     is_incremental = (mode == "INCREMENTAL")
 
-    prev_weights = None
-    if is_incremental:
-        prev_weights = get_champion_weights(CONFIG["model_registry_name"], device)
-        if prev_weights is None:
-            is_incremental = False
+    prev_weights = get_champion_weights(CONFIG["model_registry_name"], device) if is_incremental else None
+
+    model = ConvLSTMWeatherForecaster(
+        CONFIG["input_dim"], CONFIG["hidden_dim"], CONFIG["output_dim"],
+        CONFIG["pred_len"], CONFIG["dropout"]
+    ).to(device)
+
+    # The model is built before the loaders and the schedule because whether the
+    # champion's weights actually fit decides all three, and only a constructed model
+    # can answer that. Everything below reads the effective flag, never the request.
+    is_incremental = warm_start(model, prev_weights)
 
     epochs = resolve_epochs(is_incremental, scratch=10, incremental=2)
     lr = 1e-4 if is_incremental else 0.001
@@ -49,27 +55,19 @@ def main():
         is_incremental, max_age_hours=DEFAULT_MAX_FEATURE_AGE_HOURS
     )
 
-    model = ConvLSTMWeatherForecaster(
-        CONFIG["input_dim"], CONFIG["hidden_dim"], CONFIG["output_dim"],
-        CONFIG["pred_len"], CONFIG["dropout"]
-    ).to(device)
-
-    if prev_weights:
-        model.load_state_dict(prev_weights)
-        logger.info("Successfully warm-started Conv-LSTM model with previous weights.")
-
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=CONFIG["weight_decay"])
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
 
     hyperparams = {
         **CONFIG,
         # The mode this run actually took, not the one it was asked for. A run routed
-        # to INCREMENTAL silently falls back to scratch when there is no champion to
-        # resume from, and logging the request instead is what kept a warm-start path
-        # that never worked at all from ever showing up in MLflow.
+        # to INCREMENTAL falls back to scratch when there is no champion to resume
+        # from, and now also when the champion no longer fits the architecture.
+        # Logging the request instead is what kept a warm-start path that never
+        # worked at all from ever showing up in MLflow.
         "training_mode": "INCREMENTAL" if is_incremental else "SCRATCH",
         "requested_mode": mode,
-        "warm_started": prev_weights is not None,
+        "warm_started": is_incremental,
         "model_architecture": "Conv-LSTM", "epochs": epochs, "initial_lr": lr, "optimizer": "AdamW",
     }
 

@@ -84,6 +84,37 @@ def get_champion_weights(registry_name, device):
         return None
 
 
+def warm_start(model, weights) -> bool:
+    """Loads champion weights into a freshly built model. True if they fitted.
+
+    The caller must treat False as "this run is a scratch run" - not just for the
+    weights, but for the epoch budget, the learning rate and the data window, all of
+    which get_dataloaders and resolve_epochs pick from the same flag. Two incremental
+    epochs at 1e-4 on the recent-window split is a fine way to adapt a champion and a
+    terrible way to train a randomly initialised model.
+
+    The mismatch case is not hypothetical: any hyperparameter that changes a tensor
+    shape - a wider d_model, another layer, a different input width - leaves the
+    champion's state dict incompatible with the architecture just built. strict
+    load_state_dict raises there, so the weekly INCREMENTAL run would fail as a DAG
+    error the first Sunday after any such change, when the obviously right response is
+    the one get_champion_weights already takes when it cannot fetch the champion at
+    all: there is nothing to resume from, so start over.
+    """
+    if not weights:
+        return False
+    try:
+        model.load_state_dict(weights)
+    except RuntimeError as e:
+        logger.info(
+            f"The champion's weights do not fit the current architecture ({e}). "
+            "Training from scratch."
+        )
+        return False
+    logger.info("Warm-started from the champion's weights.")
+    return True
+
+
 def _export_onnx(model, sample_input, onnx_path):
     """Exports the trained float model to ONNX with a dynamic batch dimension."""
     torch.onnx.export(
