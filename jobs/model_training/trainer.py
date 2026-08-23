@@ -14,7 +14,6 @@ from lakehouse import MLFLOW_TRACKING_URI, ONNX_ARTIFACT_NAME, ONNX_OPSET, S3_EN
 logger = logging.getLogger("ML_Training")
 
 
-
 def _configure_mlflow() -> None:
     """Point this process at the tracking server and at MinIO.
 
