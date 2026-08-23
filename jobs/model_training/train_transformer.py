@@ -23,8 +23,12 @@ CONFIG = {
     "table_name": "weather.ml_features",
     "seq_len": SEQ_LEN, "pred_len": PRED_LEN, "batch_size": 128,
     "input_dim": INPUT_CHANNELS, "output_dim": OUTPUT_CHANNELS,
-    "d_model": 32, "n_heads": 2,
-    "num_layers": 4, "dim_feedforward": 128, "dropout": 0.1,
+    # Widened for the 16-channel vector, depth deliberately held at 4 so the
+    # experiment isolates width. Head dimension is unchanged at d_model/n_heads=16
+    # and dim_feedforward keeps its 4x ratio, so this scales the model rather than
+    # reshaping it. See PROJECT_CONTEXT for the measurement this was chosen from.
+    "d_model": 64, "n_heads": 4,
+    "num_layers": 4, "dim_feedforward": 256, "dropout": 0.1,
     "patience": 4, "weight_decay": 1e-4
 }
 

@@ -42,15 +42,29 @@ def _batch():
 def test_both_architectures_map_the_input_width_to_the_output_width():
     """input_dim and output_dim used to be the same number passed twice. They are
     genuinely different now, and passing the input width as the output width would
-    have the model emitting calendar predictions nobody reads."""
+    have the model emitting calendar predictions nobody reads.
+
+    Built from the shipped CONFIG dicts rather than from literals. The capacity in
+    those dicts is expected to change - the hyperparameters were sized when the input
+    was four channels wide - and a copy of them here would quietly stop testing the
+    architecture this pipeline actually trains. It also means a capacity change that
+    does not construct at all, such as an n_heads that no longer divides d_model,
+    fails here rather than an hour into a GPU run."""
+    import train_lstm
+    import train_transformer
+
     expected = (2, lakehouse.PRED_LEN, lakehouse.OUTPUT_CHANNELS)
+    lstm_config, transformer_config = train_lstm.CONFIG, train_transformer.CONFIG
 
     lstm = ConvLSTMWeatherForecaster(
-        lakehouse.INPUT_CHANNELS, 64, lakehouse.OUTPUT_CHANNELS, lakehouse.PRED_LEN, 0.2
+        lstm_config["input_dim"], lstm_config["hidden_dim"], lstm_config["output_dim"],
+        lstm_config["pred_len"], lstm_config["dropout"]
     )
     transformer = TimeSeriesTransformer(
-        lakehouse.INPUT_CHANNELS, 32, 2, 4, 128,
-        lakehouse.OUTPUT_CHANNELS, lakehouse.PRED_LEN, 0.1
+        transformer_config["input_dim"], transformer_config["d_model"],
+        transformer_config["n_heads"], transformer_config["num_layers"],
+        transformer_config["dim_feedforward"], transformer_config["output_dim"],
+        transformer_config["pred_len"], transformer_config["dropout"]
     )
 
     assert lstm(_batch()).shape == expected
