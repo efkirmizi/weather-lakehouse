@@ -14,8 +14,9 @@ import mlflow.pytorch
 from mlflow.tracking import MlflowClient
 from baselines import NAIVE_FORECASTS
 from data_loader import get_dataloaders
-from lakehouse import (OUTPUT_CHANNELS, PRED_LEN, SEQ_LEN, TEMPERATURE_CHANNEL,
-                       load_iceberg_catalog, load_scaling_parameters)
+from lakehouse import (MLFLOW_TRACKING_URI, OUTPUT_CHANNELS, PRED_LEN, S3_ENDPOINT,
+                       SEQ_LEN, TEMPERATURE_CHANNEL, load_iceberg_catalog,
+                       load_scaling_parameters)
 from promotion import promotion_verdict
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -169,8 +170,8 @@ def resolve_temperature_std(load_catalog) -> "tuple[float, str]":
 
 
 def evaluate_and_promote(model_name: str, table_name: str = "weather.ml_features"):
-    os.environ["MLFLOW_S3_ENDPOINT_URL"] = "http://minio:9000"
-    mlflow.set_tracking_uri("http://mlflow:5000")
+    os.environ["MLFLOW_S3_ENDPOINT_URL"] = S3_ENDPOINT
+    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
     mlflow.set_experiment(f"{model_name}_Evaluations")
     client = MlflowClient()
 

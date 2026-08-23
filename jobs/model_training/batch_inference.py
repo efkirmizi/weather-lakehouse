@@ -17,7 +17,8 @@ from mlflow.exceptions import MlflowException
 from mlflow.tracking import MlflowClient
 
 from lakehouse import (
-    load_iceberg_catalog, scan_ordered, ONNX_ARTIFACT_NAME, SEQ_LEN, PRED_LEN,
+    load_iceberg_catalog, scan_ordered, MLFLOW_TRACKING_URI, ONNX_ARTIFACT_NAME,
+    S3_ENDPOINT, SEQ_LEN, PRED_LEN,
 )
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -195,8 +196,8 @@ def forecast_rows(model_name, version, future_timestamps, predictions, now_utc):
 
 
 def main():
-    os.environ["MLFLOW_S3_ENDPOINT_URL"] = "http://minio:9000"
-    mlflow.set_tracking_uri("http://mlflow:5000")
+    os.environ["MLFLOW_S3_ENDPOINT_URL"] = S3_ENDPOINT
+    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
     client = MlflowClient()
 
     # 1. Dynamically Discover All Active Champions

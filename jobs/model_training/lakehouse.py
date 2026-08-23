@@ -8,6 +8,8 @@ from pyiceberg.catalog import load_catalog
 
 CATALOG_URI = "http://nessie:19120/iceberg/main"
 S3_ENDPOINT = "http://minio:9000"
+# Was a literal in trainer.py, batch_inference.py and evaluate_and_promote.py.
+MLFLOW_TRACKING_URI = "http://mlflow:5000"
 
 # The registry entry carries the float "pytorch" flavor (warm-start + benchmark).
 # trainer.py logs the serving graph beside it in the same run under this name,

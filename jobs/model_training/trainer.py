@@ -9,12 +9,10 @@ import mlflow.onnx
 import onnx
 from mlflow.tracking import MlflowClient
 
-from lakehouse import ONNX_ARTIFACT_NAME, ONNX_OPSET
+from lakehouse import MLFLOW_TRACKING_URI, ONNX_ARTIFACT_NAME, ONNX_OPSET, S3_ENDPOINT
 
 logger = logging.getLogger("ML_Training")
 
-MLFLOW_TRACKING_URI = "http://mlflow:5000"
-S3_ENDPOINT_URL = "http://minio:9000"
 
 
 def _configure_mlflow() -> None:
@@ -27,7 +25,7 @@ def _configure_mlflow() -> None:
     That is exactly how warm-starting failed silently - the branch operator queries the
     REST API directly and saw the model, the training container did not.
     """
-    os.environ["MLFLOW_S3_ENDPOINT_URL"] = S3_ENDPOINT_URL
+    os.environ["MLFLOW_S3_ENDPOINT_URL"] = S3_ENDPOINT
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
 
 
