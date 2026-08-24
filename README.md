@@ -1,5 +1,9 @@
 # Weather Lakehouse
 
+[![CI](https://github.com/efkirmizi/weather-lakehouse/actions/workflows/ci.yml/badge.svg)](https://github.com/efkirmizi/weather-lakehouse/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/python-3.11-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
+
 An end-to-end lakehouse + MLOps stack that runs on a single machine: hourly weather
 observations for one location land in Apache Iceberg, PySpark turns them into
 normalized ML features, two PyTorch architectures compete for a `@champion` alias in
@@ -9,6 +13,27 @@ FastAPI and Streamlit.
 Scope is deliberately a single site (see [Known limitations](#known-limitations));
 the name says lakehouse rather than pipeline because the catalog, serving and model
 registry layers are part of it, not just the ETL.
+
+The champion forecasts a full day ahead **16.5% better than a seasonal baseline**, and
+the promotion gate that decides which model serves has rejected a plausible change on
+the evidence — see [Results](#results) for both experiments, including the one that
+failed.
+
+**Contents**
+
+| | |
+|---|---|
+| **What it does** | [Stack](#stack) · [Results](#results) · [Running it](#running-it) · [Pipeline](#pipeline) |
+| **Data** | [Data model](#data-model) · [Feature normalization](#feature-normalization) · [Sequence ordering](#sequence-ordering) · [Timestamps](#timestamps) |
+| **Modelling** | [Train / validation / test / adapt](#train--validation--test--adapt) · [Promotion](#promotion) · [Drift detection](#drift-detection) · [Model artifacts](#model-artifacts) |
+| **Running it for real** | [Forecast idempotency](#forecast-idempotency) · [Maintenance and garbage collection](#maintenance-and-garbage-collection) · [Operations](#operations) |
+| **Engineering** | [Tests](#tests) · [Known limitations](#known-limitations) · [Project status](#project-status) |
+
+Most sections explain a decision and the failure that motivated it, rather than
+restating what the code does. If you only read three, read
+[Results](#results), [Promotion](#promotion) and
+[Train / validation / test / adapt](#train--validation--test--adapt) — that is where
+the reasoning that matters lives.
 
 ## Stack
 
@@ -23,6 +48,110 @@ registry layers are part of it, not just the ETL.
 | Serving graph | ONNX Runtime (CPU) |
 | MLOps | MLflow 3.15.1 — tracking + Model Registry with alias-based promotion |
 | Serving | FastAPI (`:8000`) + Streamlit/Plotly (`:8501`) |
+
+## Results
+
+Every number here is measured on the same held-out block: 113,856 windows the models
+were never fitted or early-stopped on.
+
+The current per-horizon figures and the capacity experiment below come straight from
+`evaluate_and_promote`, the same code path that decides deployments. The
+before/after table for the feature change was produced by a standalone script, because
+the run that would have gated it lost its artifact upload to a disk fault — but its
+"after" column was later reproduced digit for digit by the gate itself, which is the
+only reason it is quoted here.
+
+### Forecast skill
+
+Temperature RMSE in °C, per forecast horizon. Lower is better.
+
+| horizon | Transformer | FastLSTM | seasonal-naive | persistence | Transformer skill |
+|---|---|---|---|---|---|
+| t+1  | **0.813** | 0.868 | 2.524 | 0.982 | **67.8%** |
+| t+3  | **1.124** | 1.146 | 2.524 | — | **55.5%** |
+| t+6  | **1.437** | 1.432 | 2.524 | 4.192 | **43.1%** |
+| t+12 | **1.782** | 1.825 | 2.524 | 5.591 | **29.4%** |
+| t+18 | **1.961** | 1.998 | 2.524 | — | **22.3%** |
+| t+24 | **2.108** | 2.175 | 2.524 | 2.524 | **16.5%** |
+
+Skill is against `seasonal_naive`, the harder of the two baselines over the full
+horizon. Both baselines are reported because each is only hard in one place:
+persistence wins at t+1 and collapses by t+6, while seasonal-naive is flat by
+construction — it predicts the same hour yesterday, so its error does not depend on
+how far ahead you ask. They meet at exactly t+24, where "the last observed hour" and
+"the same hour yesterday" are the same reading.
+
+**The shape of that column is the honest headline.** Forecasting the next hour is
+nearly free; forecasting a full day ahead is where a model earns its keep, and 16.5%
+over a seasonal baseline at t+24 is a real but modest margin. A single averaged RMSE
+would have hidden both facts.
+
+### Two experiments, one positive and one negative
+
+The pipeline exists to answer "does this change help?" with evidence. It has been
+asked twice, and the second answer was no.
+
+**1. More inputs — the feature vector went from 4 channels to 16.** Ten standardized
+weather variables (temperature, humidity, precipitation, wind speed, pressure, dew
+point, cloud cover, shortwave radiation, soil temperature, soil moisture) plus sin/cos
+pairs for wind direction, hour of day and day of year. Tables dropped and rebuilt from
+1940, both models retrained from scratch:
+
+| | before | after | change |
+|---|---|---|---|
+| FastLSTM, mean RMSE | 1.873 | **1.762** | −5.9% |
+| Transformer, mean RMSE | 1.881 | **1.724** | −8.3% |
+| Transformer skill at t+24 | 8.7% | **16.5%** | nearly doubled |
+
+Every horizon improved for both architectures. The architectures also separated: they
+had previously landed within 0.4% of each other, and the Transformer turned out to use
+the extra inputs better.
+
+The design record for this change is in
+[`docs/design/`](docs/design/2026-08-22-exogenous-and-calendar-features.md) and the
+task breakdown in [`docs/plans/`](docs/plans/2026-08-22-exogenous-and-calendar-features.md)
+— written before the code, including the channel layout the three images still agree on
+today.
+
+**2. A bigger model — the Transformer's width was scaled 3.8×.** `d_model` 32 → 64,
+`n_heads` 2 → 4, `dim_feedforward` 128 → 256, depth held at 4 so the experiment read as
+width alone. 54,528 → 207,264 parameters. The gate **rejected it**:
+
+| horizon | champion (d_model 32) | challenger (d_model 64) |
+|---|---|---|
+| t+1  | **0.813** | 0.933 |
+| t+6  | **1.437** | 1.488 |
+| t+12 | **1.782** | 1.807 |
+| t+24 | **2.108** | 2.186 |
+
+`PROMOTION REJECTED ... improvement -0.274% is below the 0.1% floor.` Worse at every
+horizon, not just on the summary. The training curve had already said so: validation
+loss bottomed at epoch 4 and rose for three consecutive epochs while training loss kept
+falling. Early stopping kept epoch 4's weights and epoch 4's weights still lost.
+
+**Read together: this problem is limited by what the model is told, not by how much
+model there is.** Four times the input bought −8.3%; four times the parameters bought
+−0.3% in the wrong direction. The rejected configuration was reverted in the same pass,
+because leaving it would have made every weekly incremental run silently fall back to a
+full ten-epoch retrain.
+
+### Why these numbers are comparable
+
+Points of method that make the two tables above mean something:
+
+- **The baselines are the control.** `seasonal_naive` reads 2.524 in every table on
+  this page. It cannot be affected by a model change, so a run where it moved would
+  mean the test block moved, and the comparison would be void.
+- **The gate scores in fp32**, not mixed precision. The margins it decides on are
+  ~0.2%, well inside AMP noise.
+- **The test block is never trained or early-stopped on.** A fourth `adapt` block
+  holds out the newest 14 days separately, so an incremental run can learn from recent
+  data without touching what the gate scores.
+- **Significance is tested on a subsample.** Consecutive windows share 95 of their 96
+  hours, so the paired t-test takes one window per horizon — ~1,186 that share no
+  timestep — rather than reporting overwhelming significance for anything at all.
+- **Both models and both baselines are scored in a single walk** of the test block, on
+  identical windows by construction.
 
 ## Running it
 
@@ -313,14 +442,25 @@ reading rows in scan order would silently corrupt every training window and ever
 
 ## Tests
 
-There is no test-only image: each suite runs inside the image that already carries its
-dependencies, with `tests/` mounted.
+**151 tests across four suites.** There is no test-only image: each suite runs inside
+the image that already carries its dependencies, with `tests/` mounted.
 
-| Suite | Where | What it protects |
-|---|---|---|
-| `tests/static` | any Python 3.11 | DAG discoverability, function-local import shadowing, suite registration, syntax. No dependencies, instant. |
-| `tests/airflow` | the Airflow image | Parses `dags/` exactly as the scheduler does: import errors, one DAG per file, failure callbacks, GPU tasks inside the pool, deprecated arguments. |
-| `tests/unit` | training / ETL / feature-engineering / serving images | Window splitting and its *composition* into a run's train/val/test sets, gap filtering, replay caps, warm-start version selection, MLflow client configuration, epoch overrides, single-pass benchmark scoring, the ETL watermark guard, the drift anchor probe, rebuild-vs-append decisions, forecast/residual selection, timestamp literals. |
+| Suite | Count | Where | What it protects |
+|---|---|---|---|
+| `tests/static` | 6 | any Python 3.11 | DAG discoverability, function-local import shadowing, suite registration, syntax. No dependencies, instant. |
+| `tests/airflow` | 5 | the Airflow image | Parses `dags/` exactly as the scheduler does: import errors, one DAG per file, failure callbacks, GPU tasks inside the pool, deprecated arguments. |
+| `tests/unit` | 124 | training / ETL / feature-engineering / serving images | Window splitting and its *composition* into a run's train/val/test sets, gap filtering, replay caps, warm-start version selection and architecture-mismatch fallback, MLflow client configuration, epoch overrides, single-pass benchmark scoring, the ETL watermark guard, the drift anchor probe, rebuild-vs-append decisions, forecast/residual selection, timestamp literals. |
+| `tests/integration` | 16 | the training image, on the Compose network | The boundaries every unit suite has to stub: Iceberg through Nessie onto MinIO, `scan_ordered` against real out-of-order commits, the `scaling_parameters` layout three images agree on without being able to import each other, the champion's ONNX graph loaded through the URI batch inference uses, and the served forecast. |
+
+The integration suite is the one that cannot be faked. `scaling_parameters` is written
+by the feature-engineering image and read by the training and serving images, and none
+of the three can import the others — so a unit test that stubs the table is only
+asserting that one file agrees with itself. Nothing raises if the channels shift: the
+API would de-normalize channel 0 with whatever parameters sit at index 0 and draw the
+result on a chart labelled "temperature".
+
+It needs the stack running, so it is `./dev.sh test-integration` rather than part of
+`./dev.sh test`, which stays hermetic and instant.
 
 Each static check exists because that failure actually happened here. A DAG file
 that mentions neither "airflow" nor "dag" is skipped by `DAG_DISCOVERY_SAFE_MODE`
@@ -367,11 +507,13 @@ split and warm-start bugs lives, so it is the one that must not be dropped.
   container — `02` is dataset-triggered on every `01` and its container is
   auto-removed, so the cache was cold every time — and made Maven Central a hard
   runtime dependency. Bump the versions in the Dockerfiles.
-- **Error is reported per horizon.** t+1 and t+24 are not the same problem: measured
-  on the test block, the champions beat seasonal-naive by 65% at t+1 and by 9% at
-  t+24. `evaluate_and_promote` logs the curve for both models and both baselines, and
-  `/api/v1/metrics/residuals` returns one row per `(model, version, horizon)`. A
-  single averaged number describes neither end of the horizon.
+- **Error is reported per horizon.** t+1 and t+24 are not the same problem: the
+  Transformer champion beats seasonal-naive by 67.8% at t+1 and by 16.5% at t+24 (see
+  [Results](#results)). `evaluate_and_promote` logs the curve for both models and both
+  baselines, and `/api/v1/metrics/residuals` returns one row per
+  `(model, version, horizon)`. A single averaged number describes neither end of the
+  horizon, and averaging over horizons is how a residual chart hides that t+24 is three
+  times harder than t+1.
 
 ## Timestamps
 
@@ -400,3 +542,19 @@ both tables had to special-case them. Keep new tables `timestamptz`.
   Nessie, MinIO, MLflow and the API running and the 11 GB training image to run in, so
   it is `./dev.sh test-integration` after `./dev.sh up`, never a CI job. Spark is still
   covered only by running the DAGs.
+
+## Project status
+
+**Complete, and deliberately not left running.**
+
+The pipeline has run end to end, the two questions it was built to answer are recorded
+under [Results](#results) — one change accepted, one rejected — and 151 tests cover the
+paths that produced them. There is no long-lived deployment behind this repository and
+none is needed: the stack rebuilds from nothing with `./dev.sh build && ./dev.sh up`,
+which was verified from an empty machine, and the warehouse refetches itself from the
+Open-Meteo archive back to 1940.
+
+That is the design working as intended rather than a caveat. Everything with state —
+images, volumes, the MLflow registry — is reconstructible from what is committed here,
+so the repository is the artifact and the running system is a cache of it.
+

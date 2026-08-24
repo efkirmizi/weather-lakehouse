@@ -8,7 +8,7 @@
 
 **Tech Stack:** PySpark 3.5.2, PyIceberg 0.11.1, PyTorch 2.7.1, MLflow 3.15.1, FastAPI, Streamlit, pytest.
 
-**Spec:** `docs/superpowers/specs/2026-08-22-exogenous-and-calendar-features-design.md`
+**Spec:** `docs/design/2026-08-22-exogenous-and-calendar-features.md`
 
 ## Global Constraints
 
